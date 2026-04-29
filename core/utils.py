@@ -187,7 +187,7 @@ class PlayerThirdPerson(PlayerController):
         movement = numpy.array([input_x, input_y], dtype=numpy.float32)
         movement /= max(float(numpy.linalg.norm(movement)), 1e-6)
 
-        input_angle = numpy.degrees(numpy.arctan2(movement[0], movement[1]))
+        input_angle = numpy.degrees(numpy.arctan2(-movement[0], movement[1]))
         self.facing_yaw = float((self.camera.theta + input_angle) % 360.0)
         facing_radians = numpy.radians(self.facing_yaw)
         return numpy.array(
