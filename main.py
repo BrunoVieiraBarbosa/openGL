@@ -31,6 +31,11 @@ class GameWindow(App):
             world_x - self.terrain_origin[0],
             world_y - self.terrain_origin[1],
         ) + self.terrain_origin[2]
+        self.terrain_contains = lambda world_x, world_y, radius=0.0: self.terrain_sampler.contains_circle(
+            world_x - self.terrain_origin[0],
+            world_y - self.terrain_origin[1],
+            radius,
+        )
 
         self.add_shader("first", Shader.create_shader("shaders/vertex.c", "shaders/fragment.c"))
         self.add_shader("simple", Shader.create_shader("shaders/vertex_rgb.c", "shaders/fragment_rgb.c"))
@@ -99,14 +104,14 @@ class GameWindow(App):
         self.terrain = Mesh(self.shaders[0], self.ground_texture, self.terrain_origin, ground_vertices)
 
         obj_scene = [
-            ("nem.obj", [-2, -1, 0], self.texture),
-            ("monkey.obj", [7, -3, 0], self.texture),
-            ("IronMan.obj", [27, 1, 0], self.texture),
-            ("break_time.obj", [12, 12, 0], self.texture),
-            ("cube.obj", [24, 10, 0], self.texture2),
+            ("nem.obj", [-2, -1, 0], self.texture, 0.42, 0.08),
+            ("monkey.obj", [7, -3, 0], self.texture, 0.5, 0.12),
+            ("IronMan.obj", [27, 1, 0], self.texture, 0.38, 0.1),
+            ("break_time.obj", [12, 12, 0], self.texture, 0.44, 0.1),
+            ("cube.obj", [24, 10, 0], self.texture2, 0.7, 0.12),
         ]
         self.scene_meshes = []
-        for file_name, position, material in obj_scene:
+        for file_name, position, material, collider_radius_scale, collider_radius_padding in obj_scene:
             vertices = Mesh.load_obj_prepared(
                 os.path.join("obj", file_name),
                 invert_texcoord=True,
@@ -115,7 +120,14 @@ class GameWindow(App):
                 target_size=1.8,
             )
             grounded_position = [position[0], position[1], self.terrain_height(position[0], position[1])]
-            self.scene_meshes.append(Mesh(self.shaders[0], material, grounded_position, vertices))
+            mesh = Mesh(self.shaders[0], material, grounded_position, vertices)
+            mesh.set_collider(
+                mode="circle",
+                radius_scale=collider_radius_scale,
+                radius_padding=collider_radius_padding,
+                height_padding=0.1,
+            )
+            self.scene_meshes.append(mesh)
 
         self.cubes = [
             Mesh(
@@ -132,6 +144,7 @@ class GameWindow(App):
         ]
         for cube in self.cubes:
             cube.position[2] = self.terrain_height(cube.position[0], cube.position[1]) + 0.18
+            cube.set_collider(mode="circle", radius_scale=1.0, radius_padding=0.08, height_padding=0.08)
 
         self.camera = CameraFirstPerson([10, -14, self.terrain_height(10, -14) + 1.7])
         self.camera.theta = 72
@@ -144,6 +157,7 @@ class GameWindow(App):
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
             ground_height_fn=self.terrain_height,
+            terrain_contains_fn=self.terrain_contains,
         )
         self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
 

@@ -88,6 +88,15 @@ class TerrainGridSampler:
             local_y,
         )
 
+    def contains_point(self, x, y, padding=0.0):
+        return (
+            self.min_x + padding <= float(x) <= self.max_x - padding
+            and self.min_y + padding <= float(y) <= self.max_y - padding
+        )
+
+    def contains_circle(self, x, y, radius):
+        return self.contains_point(x, y, padding=float(radius))
+
     @staticmethod
     def _sample_triangle(a, b, c, px, py):
         ax, ay, az = a
@@ -113,6 +122,10 @@ class Mesh:
         self.shader = shader
         self.position = position
         self.scale = scale
+        self.collider_mode = "aabb"
+        self.collider_radius_scale = 0.45
+        self.collider_radius_padding = 0.0
+        self.collider_height_padding = 0.0
         self.rotation = [0, 0, 0]
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
@@ -519,6 +532,43 @@ class Mesh:
         scaled_max = maximum * self.scale
         position = numpy.array(self.position, dtype=numpy.float32)
         return scaled_min + position, scaled_max + position
+
+    def set_collider(self, mode="aabb", radius_scale=None, radius_padding=None, height_padding=None):
+        self.collider_mode = mode
+        if radius_scale is not None:
+            self.collider_radius_scale = float(radius_scale)
+        if radius_padding is not None:
+            self.collider_radius_padding = float(radius_padding)
+        if height_padding is not None:
+            self.collider_height_padding = float(height_padding)
+        return self
+
+    def get_ground_footprint(self):
+        bounds_min, bounds_max = self.get_world_bounds()
+        center_x = float((bounds_min[0] + bounds_max[0]) / 2.0)
+        center_y = float((bounds_min[1] + bounds_max[1]) / 2.0)
+        half_width = float((bounds_max[0] - bounds_min[0]) / 2.0)
+        half_depth = float((bounds_max[1] - bounds_min[1]) / 2.0)
+        radius = max(half_width, half_depth) * self.collider_radius_scale + self.collider_radius_padding
+        return center_x, center_y, radius
+
+    def collides_with_circle(self, position, radius, probe_z):
+        bounds_min, bounds_max = self.get_world_bounds()
+        if probe_z < bounds_min[2] - self.collider_height_padding or probe_z > bounds_max[2] + 2.0 + self.collider_height_padding:
+            return False
+
+        if self.collider_mode == "circle":
+            center_x, center_y, obstacle_radius = self.get_ground_footprint()
+            delta_x = float(position[0] - center_x)
+            delta_y = float(position[1] - center_y)
+            total_radius = float(radius + obstacle_radius)
+            return delta_x * delta_x + delta_y * delta_y < total_radius * total_radius
+
+        closest_x = min(max(position[0], bounds_min[0]), bounds_max[0])
+        closest_y = min(max(position[1], bounds_min[1]), bounds_max[1])
+        delta_x = position[0] - closest_x
+        delta_y = position[1] - closest_y
+        return delta_x * delta_x + delta_y * delta_y < radius * radius
 
 
     def _build_model_matrix(self, rotation_matrix):

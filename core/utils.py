@@ -5,7 +5,15 @@ from core.core import CameraFirstPerson
 
 
 class PlayerFirstPerson:
-    def __init__(self, camera: CameraFirstPerson, shaders, colliders=None, terrain_bounds=None, ground_height_fn=None) -> None:
+    def __init__(
+        self,
+        camera: CameraFirstPerson,
+        shaders,
+        colliders=None,
+        terrain_bounds=None,
+        ground_height_fn=None,
+        terrain_contains_fn=None,
+    ) -> None:
         self.camera = camera
         self.shaders = shaders
         self.speed = 6
@@ -14,7 +22,8 @@ class PlayerFirstPerson:
         self.colliders = colliders or []
         self.terrain_bounds = terrain_bounds
         self.ground_height_fn = ground_height_fn
-        self.radius = 0.35
+        self.terrain_contains_fn = terrain_contains_fn
+        self.radius = 0.4
         self.eye_height = 1.7
         self.ground_height = 0.0
         self.camera.position[2] = self.ground_height + self.eye_height
@@ -72,6 +81,9 @@ class PlayerFirstPerson:
         return float(self.ground_height_fn(x, y))
 
     def _is_blocked(self, position):
+        if self.terrain_contains_fn is not None and not self.terrain_contains_fn(position[0], position[1], self.radius):
+            return True
+
         if self.terrain_bounds is not None:
             terrain_min, terrain_max = self.terrain_bounds
             if position[0] - self.radius < terrain_min[0] or position[0] + self.radius > terrain_max[0]:
@@ -79,18 +91,10 @@ class PlayerFirstPerson:
             if position[1] - self.radius < terrain_min[1] or position[1] + self.radius > terrain_max[1]:
                 return True
 
+        probe_z = self._sample_ground_height(position[0], position[1]) + self.eye_height
+
         for collider in self.colliders:
-            bounds_min, bounds_max = collider.get_world_bounds()
-
-            if position[2] < bounds_min[2] or position[2] > bounds_max[2] + 2.0:
-                continue
-
-            closest_x = min(max(position[0], bounds_min[0]), bounds_max[0])
-            closest_y = min(max(position[1], bounds_min[1]), bounds_max[1])
-            delta_x = position[0] - closest_x
-            delta_y = position[1] - closest_y
-
-            if delta_x * delta_x + delta_y * delta_y < self.radius * self.radius:
+            if collider.collides_with_circle(position, self.radius, probe_z):
                 return True
 
         return False
