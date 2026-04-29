@@ -6,6 +6,104 @@ from OpenGL.GL import *
 import numpy, pyrr
 
 
+class TerrainGridSampler:
+    def __init__(self, vertices, clamp_outside=True) -> None:
+        self.clamp_outside = clamp_outside
+        self.vertices = numpy.array(vertices, dtype=numpy.float32)
+        if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
+            raise ValueError("TerrainGridSampler expects Nx3 vertices.")
+
+        self.x_values = numpy.unique(numpy.round(self.vertices[:, 0], decimals=6))
+        self.y_values = numpy.unique(numpy.round(self.vertices[:, 1], decimals=6))
+        self.cols = len(self.x_values)
+        self.rows = len(self.y_values)
+
+        if self.cols < 2 or self.rows < 2 or self.cols * self.rows != len(self.vertices):
+            raise ValueError("TerrainGridSampler could not reconstruct a regular grid from OBJ vertices.")
+
+        self.min_x = float(self.x_values[0])
+        self.max_x = float(self.x_values[-1])
+        self.min_y = float(self.y_values[0])
+        self.max_y = float(self.y_values[-1])
+
+        self.height_grid = numpy.zeros((self.rows, self.cols), dtype=numpy.float32)
+        x_lookup = {round(float(value), 6): index for index, value in enumerate(self.x_values)}
+        y_lookup = {round(float(value), 6): index for index, value in enumerate(self.y_values)}
+        for x, y, z in self.vertices:
+            self.height_grid[y_lookup[round(float(y), 6)], x_lookup[round(float(x), 6)]] = z
+
+    @classmethod
+    def from_obj(cls, file_name):
+        vertices = []
+        with open(file_name, "r", encoding="utf-8") as file:
+            for line in file:
+                if not line.startswith("v "):
+                    continue
+                values = line.split()
+                vertices.append((float(values[1]), float(values[2]), float(values[3])))
+        return cls(vertices)
+
+    def sample_height(self, x, y):
+        local_x = float(x)
+        local_y = float(y)
+
+        if self.clamp_outside:
+            local_x = min(max(local_x, self.min_x), self.max_x)
+            local_y = min(max(local_y, self.min_y), self.max_y)
+        elif local_x < self.min_x or local_x > self.max_x or local_y < self.min_y or local_y > self.max_y:
+            return 0.0
+
+        col = int(numpy.searchsorted(self.x_values, local_x, side="right") - 1)
+        row = int(numpy.searchsorted(self.y_values, local_y, side="right") - 1)
+        col = max(0, min(col, self.cols - 2))
+        row = max(0, min(row, self.rows - 2))
+
+        x0 = float(self.x_values[col])
+        x1 = float(self.x_values[col + 1])
+        y0 = float(self.y_values[row])
+        y1 = float(self.y_values[row + 1])
+
+        z00 = float(self.height_grid[row, col])
+        z10 = float(self.height_grid[row, col + 1])
+        z11 = float(self.height_grid[row + 1, col + 1])
+        z01 = float(self.height_grid[row + 1, col])
+
+        tx = 0.0 if x1 == x0 else (local_x - x0) / (x1 - x0)
+        ty = 0.0 if y1 == y0 else (local_y - y0) / (y1 - y0)
+
+        if tx >= ty:
+            return self._sample_triangle(
+                (x0, y0, z00),
+                (x1, y0, z10),
+                (x1, y1, z11),
+                local_x,
+                local_y,
+            )
+
+        return self._sample_triangle(
+            (x1, y1, z11),
+            (x0, y1, z01),
+            (x0, y0, z00),
+            local_x,
+            local_y,
+        )
+
+    @staticmethod
+    def _sample_triangle(a, b, c, px, py):
+        ax, ay, az = a
+        bx, by, bz = b
+        cx, cy, cz = c
+
+        denominator = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(denominator) < 1e-6:
+            return az
+
+        w1 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / denominator
+        w2 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denominator
+        w3 = 1.0 - w1 - w2
+        return (w1 * az) + (w2 * bz) + (w3 * cz)
+
+
 class Mesh:
     CACHE_DIR = Path(".cache") / "obj"
     PREPARED_CACHE_DIR = Path(".cache") / "obj_prepared"
@@ -158,7 +256,14 @@ class Mesh:
 
 
     @staticmethod
-    def load_obj_prepared(file_name, invert_texcoord=True, st_pos=4, vertex_size=8, target_size=3.5):
+    def load_obj_prepared(
+        file_name,
+        invert_texcoord=True,
+        st_pos=4,
+        vertex_size=8,
+        target_size=3.5,
+        normalize=True,
+    ):
         source_path = Path(file_name)
         cache_file = Mesh._get_prepared_cache_path(
             source_path,
@@ -166,6 +271,7 @@ class Mesh:
             st_pos=st_pos,
             vertex_size=vertex_size,
             target_size=target_size,
+            normalize=normalize,
         )
         source_stat = source_path.stat()
 
@@ -177,7 +283,8 @@ class Mesh:
         vertices = Mesh.load_obj(file_name)
         if invert_texcoord:
             vertices = Mesh.invert_s_or_t(vertices, st_pos, vertex_size)
-        vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
+        if normalize:
+            vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
         return vertices
 
@@ -279,6 +386,124 @@ class Mesh:
             -half_width,  half_depth, 0.0, 0.0, uv_scale, 0.0, 0.0, 1.0,
             -half_width, -half_depth, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         )
+
+
+    @staticmethod
+    def create_terrain(width=40.0, depth=30.0, rows=40, cols=40, uv_scale=6.0, height_fn=None):
+        def sample_height(x, y):
+            if height_fn is None:
+                return 0.0
+            return float(height_fn(x, y))
+
+        def sample_normal(x, y):
+            epsilon = 0.25
+            h_l = sample_height(x - epsilon, y)
+            h_r = sample_height(x + epsilon, y)
+            h_d = sample_height(x, y - epsilon)
+            h_u = sample_height(x, y + epsilon)
+            normal = numpy.array([h_l - h_r, h_d - h_u, 2.0], dtype=numpy.float32)
+            normal /= max(numpy.linalg.norm(normal), 1e-6)
+            return normal
+
+        vertices = []
+        half_width = width / 2
+        half_depth = depth / 2
+        step_x = width / cols
+        step_y = depth / rows
+
+        for row in range(rows):
+            y0 = -half_depth + row * step_y
+            y1 = y0 + step_y
+            v0 = (row / rows) * uv_scale
+            v1 = ((row + 1) / rows) * uv_scale
+
+            for col in range(cols):
+                x0 = -half_width + col * step_x
+                x1 = x0 + step_x
+                u0 = (col / cols) * uv_scale
+                u1 = ((col + 1) / cols) * uv_scale
+
+                p00 = (x0, y0, sample_height(x0, y0), u0, v0, *sample_normal(x0, y0))
+                p10 = (x1, y0, sample_height(x1, y0), u1, v0, *sample_normal(x1, y0))
+                p11 = (x1, y1, sample_height(x1, y1), u1, v1, *sample_normal(x1, y1))
+                p01 = (x0, y1, sample_height(x0, y1), u0, v1, *sample_normal(x0, y1))
+
+                vertices.extend(p00)
+                vertices.extend(p10)
+                vertices.extend(p11)
+                vertices.extend(p11)
+                vertices.extend(p01)
+                vertices.extend(p00)
+
+        return tuple(vertices)
+
+
+    @staticmethod
+    def export_grid_obj(file_name, width=40.0, depth=30.0, rows=40, cols=40, uv_scale=6.0, height_fn=None):
+        def sample_height(x, y):
+            if height_fn is None:
+                return 0.0
+            return float(height_fn(x, y))
+
+        def sample_normal(x, y):
+            epsilon = 0.25
+            h_l = sample_height(x - epsilon, y)
+            h_r = sample_height(x + epsilon, y)
+            h_d = sample_height(x, y - epsilon)
+            h_u = sample_height(x, y + epsilon)
+            normal = numpy.array([h_l - h_r, h_d - h_u, 2.0], dtype=numpy.float32)
+            normal /= max(numpy.linalg.norm(normal), 1e-6)
+            return normal
+
+        output_path = Path(file_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        half_width = width / 2
+        half_depth = depth / 2
+        step_x = width / cols
+        step_y = depth / rows
+
+        vertices = []
+        texcoords = []
+        normals = []
+
+        for row in range(rows + 1):
+            y = -half_depth + row * step_y
+            v = (row / rows) * uv_scale
+            for col in range(cols + 1):
+                x = -half_width + col * step_x
+                u = (col / cols) * uv_scale
+                vertices.append((x, y, sample_height(x, y)))
+                texcoords.append((u, v))
+                normals.append(tuple(sample_normal(x, y)))
+
+        def grid_index(row, col):
+            return row * (cols + 1) + col + 1
+
+        lines = ["# generated terrain", "g terrain"]
+        for x, y, z in vertices:
+            lines.append(f"v {x:.6f} {y:.6f} {z:.6f}")
+        for u, v in texcoords:
+            lines.append(f"vt {u:.6f} {v:.6f}")
+        for nx, ny, nz in normals:
+            lines.append(f"vn {nx:.6f} {ny:.6f} {nz:.6f}")
+
+        for row in range(rows):
+            for col in range(cols):
+                p00 = grid_index(row, col)
+                p10 = grid_index(row, col + 1)
+                p11 = grid_index(row + 1, col + 1)
+                p01 = grid_index(row + 1, col)
+                lines.append(f"f {p00}/{p00}/{p00} {p10}/{p10}/{p10} {p11}/{p11}/{p11}")
+                lines.append(f"f {p11}/{p11}/{p11} {p01}/{p01}/{p01} {p00}/{p00}/{p00}")
+
+        content = "\n".join(lines) + "\n"
+        if output_path.exists():
+            existing_content = output_path.read_text(encoding="utf-8")
+            if existing_content == content:
+                return
+
+        output_path.write_text(content, encoding="utf-8")
 
 
     def _compute_local_bounds(self):

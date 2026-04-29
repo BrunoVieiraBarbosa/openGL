@@ -5,7 +5,7 @@ from core.core import CameraFirstPerson
 
 
 class PlayerFirstPerson:
-    def __init__(self, camera: CameraFirstPerson, shaders, colliders=None, terrain_bounds=None) -> None:
+    def __init__(self, camera: CameraFirstPerson, shaders, colliders=None, terrain_bounds=None, ground_height_fn=None) -> None:
         self.camera = camera
         self.shaders = shaders
         self.speed = 6
@@ -13,6 +13,7 @@ class PlayerFirstPerson:
         self.keys_down = set()
         self.colliders = colliders or []
         self.terrain_bounds = terrain_bounds
+        self.ground_height_fn = ground_height_fn
         self.radius = 0.35
         self.eye_height = 1.7
         self.ground_height = 0.0
@@ -39,6 +40,7 @@ class PlayerFirstPerson:
         if arcade.key.D in self.keys_down:
             self.move(-90, self.speed * delta_time)
 
+        self.ground_height = self._sample_ground_height(self.camera.position[0], self.camera.position[1])
         self.camera.position[2] = self.ground_height + self.eye_height
         self.camera.update(self.shaders)
 
@@ -63,6 +65,11 @@ class PlayerFirstPerson:
 
     def rotate(self, horizontal, vertical):
         self.camera.increment_direction(horizontal, vertical)
+
+    def _sample_ground_height(self, x, y):
+        if self.ground_height_fn is None:
+            return 0.0
+        return float(self.ground_height_fn(x, y))
 
     def _is_blocked(self, position):
         if self.terrain_bounds is not None:

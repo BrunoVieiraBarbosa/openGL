@@ -7,7 +7,7 @@ from OpenGL.GL import *
 
 from core.core import *
 from core.light import DirectionalLight, PointLight
-from core.mesh import Mesh, MeshRGB
+from core.mesh import Mesh, MeshRGB, TerrainGridSampler
 from core.utils import *
 
 
@@ -24,6 +24,14 @@ class GameWindow(App):
         self._setup_scene()
 
     def _setup_scene(self):
+        self.terrain_origin = numpy.array([10.0, 4.0, -0.02], dtype=numpy.float32)
+        self.terrain_obj_path = os.path.join("obj", "terrain_main.obj")
+        self.terrain_sampler = TerrainGridSampler.from_obj(self.terrain_obj_path)
+        self.terrain_height = lambda world_x, world_y: self.terrain_sampler.sample_height(
+            world_x - self.terrain_origin[0],
+            world_y - self.terrain_origin[1],
+        ) + self.terrain_origin[2]
+
         self.add_shader("first", Shader.create_shader("shaders/vertex.c", "shaders/fragment.c"))
         self.add_shader("simple", Shader.create_shader("shaders/vertex_rgb.c", "shaders/fragment_rgb.c"))
 
@@ -80,14 +88,20 @@ class GameWindow(App):
             os.path.join("textures", "normal.jpg"),
         )
 
-        ground_vertices = Mesh.create_plane(width=52.0, depth=38.0, uv_scale=3.5)
-        self.terrain = Mesh(self.shaders[0], self.ground_texture, [10, 4, -0.02], ground_vertices)
+        ground_vertices = Mesh.load_obj_prepared(
+            self.terrain_obj_path,
+            invert_texcoord=False,
+            st_pos=4,
+            vertex_size=8,
+            target_size=52.0,
+            normalize=False,
+        )
+        self.terrain = Mesh(self.shaders[0], self.ground_texture, self.terrain_origin, ground_vertices)
 
         obj_scene = [
             ("nem.obj", [-2, -1, 0], self.texture),
             ("monkey.obj", [7, -3, 0], self.texture),
             ("IronMan.obj", [27, 1, 0], self.texture),
-            ("untitled.obj", [1, 10, 0], self.texture),
             ("break_time.obj", [12, 12, 0], self.texture),
             ("cube.obj", [24, 10, 0], self.texture2),
         ]
@@ -100,18 +114,26 @@ class GameWindow(App):
                 vertex_size=8,
                 target_size=1.8,
             )
-            self.scene_meshes.append(Mesh(self.shaders[0], material, position, vertices))
+            grounded_position = [position[0], position[1], self.terrain_height(position[0], position[1])]
+            self.scene_meshes.append(Mesh(self.shaders[0], material, grounded_position, vertices))
 
         self.cubes = [
             Mesh(
                 self.shaders[0],
                 self.texture2,
-                [random.randint(-6, 30), random.randint(-8, 16), 0.18],
+                [
+                    random.randint(-6, 30),
+                    random.randint(-8, 16),
+                    0.0,
+                ],
                 scale=0.18,
             )
             for _ in range(10)
         ]
-        self.camera = CameraFirstPerson([10, -14, 1.7])
+        for cube in self.cubes:
+            cube.position[2] = self.terrain_height(cube.position[0], cube.position[1]) + 0.18
+
+        self.camera = CameraFirstPerson([10, -14, self.terrain_height(10, -14) + 1.7])
         self.camera.theta = 72
         self.camera.phi = -8
         self.sky.position = self.camera
@@ -121,6 +143,7 @@ class GameWindow(App):
             [self.shaders[0], self.shaders[1]],
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
+            ground_height_fn=self.terrain_height,
         )
         self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
 
