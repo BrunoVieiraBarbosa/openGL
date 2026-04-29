@@ -3,6 +3,7 @@ import random
 
 import arcade
 import numpy
+from PIL import Image
 from OpenGL.GL import *
 
 from core.core import *
@@ -147,15 +148,22 @@ class GameWindow(App):
             cube.set_collider(mode="circle", radius_scale=1.0, radius_padding=0.08, height_padding=0.08)
 
         player_start = numpy.array([10.0, -14.0, self.terrain_height(10, -14)], dtype=numpy.float32)
-        player_vertices = Mesh.load_obj_prepared(
-            os.path.join("obj", "PlayerTemp.obj"),
-            invert_texcoord=True,
+        player_vertices = Mesh.load_glb_prepared(
+            os.path.join("obj", "Player.glb"),
+            invert_texcoord=False,
             st_pos=4,
             vertex_size=8,
             target_size=1.9,
-            rotation_degrees=(90.0, 0.0, 0.0),
+            rotation_degrees=(0.0, 0.0, 0.0),
         )
-        self.player_mesh = Mesh(self.shaders[0], self.texture, player_start.copy(), player_vertices)
+        player_material_images = Mesh.load_glb_material_images(os.path.join("obj", "Player.glb"))
+        fallback_normal = Image.new("RGBA", (1, 1), (128, 128, 255, 255))
+        self.player_material = Material(
+            player_material_images.get("diffuse") or Image.new("RGBA", (1, 1), (255, 255, 255, 255)),
+            player_material_images.get("specular") or Image.new("RGBA", (1, 1), (255, 255, 255, 255)),
+            player_material_images.get("normal") or fallback_normal,
+        )
+        self.player_mesh = Mesh(self.shaders[0], self.player_material, player_start.copy(), player_vertices)
         self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
 
         self.camera = CameraThirdPerson(player_start, distance=5.6, height=1.55)
@@ -168,8 +176,8 @@ class GameWindow(App):
             [self.shaders[0], self.shaders[1]],
             self.player_mesh,
             player_start,
-            mesh_rotation_offset=(180.0, 0.0, 0.0),
-            mesh_position_offset=(0.0, 0.0, 1.9),
+            mesh_rotation_offset=(-90.0, 0.0, 0.0),
+            mesh_position_offset=(0.0, 0.0, 0.95),
             mesh_heading_offset=-90.0,
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
@@ -189,6 +197,7 @@ class GameWindow(App):
         self.texture.destroy()
         self.texture2.destroy()
         self.ground_texture.destroy()
+        self.player_material.destroy()
         self.terrain.destroy()
         self.player_mesh.destroy()
         [x.destroy() for x in self.scene_meshes]

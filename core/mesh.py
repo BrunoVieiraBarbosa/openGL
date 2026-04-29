@@ -1,9 +1,13 @@
 import hashlib
+import json
+import struct
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 from OpenGL.GL import *
 import numpy, pyrr
+from PIL import Image
 
 
 class TerrainGridSampler:
@@ -269,6 +273,60 @@ class Mesh:
 
 
     @staticmethod
+    def load_glb(file_name):
+        print(f'Carregando modelo GLB: {file_name}')
+        source_path = Path(file_name)
+        cache_file = Mesh._get_cache_path(source_path)
+        source_stat = source_path.stat()
+
+        cached_vertices = Mesh._load_cached_vertices(cache_file, source_stat)
+        if cached_vertices is not None:
+            print(f'cache carregado: {file_name}')
+            return cached_vertices
+
+        document, binary_chunk = Mesh._read_glb(source_path)
+        vertices = []
+        for mesh in document.get("meshes", []):
+            for primitive in mesh.get("primitives", []):
+                if primitive.get("mode", 4) != 4:
+                    continue
+
+                attributes = primitive.get("attributes", {})
+                positions = Mesh._read_glb_accessor(document, binary_chunk, attributes["POSITION"])
+                texcoords = None
+                normals = None
+                if "TEXCOORD_0" in attributes:
+                    texcoords = Mesh._read_glb_accessor(document, binary_chunk, attributes["TEXCOORD_0"])
+                if "NORMAL" in attributes:
+                    normals = Mesh._read_glb_accessor(document, binary_chunk, attributes["NORMAL"])
+
+                if "indices" in primitive:
+                    indices = Mesh._read_glb_accessor(document, binary_chunk, primitive["indices"]).reshape(-1)
+                else:
+                    indices = numpy.arange(len(positions), dtype=numpy.int32)
+
+                for vertex_index in indices:
+                    position = positions[int(vertex_index)]
+                    vertices.extend((float(position[0]), float(position[1]), float(position[2])))
+
+                    if texcoords is not None:
+                        uv = texcoords[int(vertex_index)]
+                        vertices.extend((float(uv[0]), float(uv[1])))
+                    else:
+                        vertices.extend((0.0, 0.0))
+
+                    if normals is not None:
+                        normal = normals[int(vertex_index)]
+                        vertices.extend((float(normal[0]), float(normal[1]), float(normal[2])))
+                    else:
+                        vertices.extend((0.0, 0.0, 1.0))
+
+        Mesh._store_cached_vertices(cache_file, source_stat, vertices)
+        print(f'modelo GLB carregado: {file_name}')
+        return vertices
+
+
+    @staticmethod
     def load_obj_prepared(
         file_name,
         invert_texcoord=True,
@@ -304,6 +362,66 @@ class Mesh:
             vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
         return vertices
+
+
+    @staticmethod
+    def load_glb_prepared(
+        file_name,
+        invert_texcoord=False,
+        st_pos=4,
+        vertex_size=8,
+        target_size=3.5,
+        normalize=True,
+        rotation_degrees=(0.0, 0.0, 0.0),
+    ):
+        source_path = Path(file_name)
+        cache_file = Mesh._get_prepared_cache_path(
+            source_path,
+            invert_texcoord=invert_texcoord,
+            st_pos=st_pos,
+            vertex_size=vertex_size,
+            target_size=target_size,
+            normalize=normalize,
+            rotation_degrees=rotation_degrees,
+        )
+        source_stat = source_path.stat()
+
+        cached_vertices = Mesh._load_cached_vertices(cache_file, source_stat)
+        if cached_vertices is not None:
+            print(f'cache preparado carregado: {file_name}')
+            return cached_vertices
+
+        vertices = Mesh.load_glb(file_name)
+        if invert_texcoord:
+            vertices = Mesh.invert_s_or_t(vertices, st_pos, vertex_size)
+        if rotation_degrees != (0.0, 0.0, 0.0):
+            vertices = Mesh.rotate_vertices(vertices, rotation_degrees=rotation_degrees, vertex_size=vertex_size)
+        if normalize:
+            vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
+        Mesh._store_cached_vertices(cache_file, source_stat, vertices)
+        return vertices
+
+
+    @staticmethod
+    def load_glb_material_images(file_name, material_index=0):
+        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        materials = document.get("materials", [])
+        if material_index >= len(materials):
+            raise ValueError(f"GLB material index {material_index} out of range for {file_name}")
+
+        material = materials[material_index]
+        pbr = material.get("pbrMetallicRoughness", {})
+
+        diffuse = Mesh._read_glb_texture_image(document, binary_chunk, pbr.get("baseColorTexture", {}).get("index"))
+        specular_info = material.get("extensions", {}).get("KHR_materials_specular", {})
+        specular = Mesh._read_glb_texture_image(document, binary_chunk, specular_info.get("specularColorTexture", {}).get("index"))
+        normal = Mesh._read_glb_texture_image(document, binary_chunk, material.get("normalTexture", {}).get("index"))
+
+        return {
+            "diffuse": diffuse,
+            "specular": specular,
+            "normal": normal,
+        }
 
 
     @staticmethod
@@ -427,6 +545,94 @@ class Mesh:
                 rotated[normal_index + 2] = float(rotated_normal[2])
 
         return rotated
+
+
+    @staticmethod
+    def _read_glb(source_path: Path):
+        data = source_path.read_bytes()
+        magic, version, _ = struct.unpack_from("<III", data, 0)
+        if magic != 0x46546C67 or version != 2:
+            raise ValueError(f"Unsupported GLB file: {source_path}")
+
+        offset = 12
+        json_chunk = None
+        binary_chunk = b""
+        while offset < len(data):
+            chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+            offset += 8
+            chunk_data = data[offset:offset + chunk_length]
+            offset += chunk_length
+
+            if chunk_type == 0x4E4F534A:
+                json_chunk = json.loads(chunk_data.decode("utf-8").rstrip("\x00"))
+            elif chunk_type == 0x004E4942:
+                binary_chunk = chunk_data
+
+        if json_chunk is None:
+            raise ValueError(f"GLB without JSON chunk: {source_path}")
+        return json_chunk, binary_chunk
+
+
+    @staticmethod
+    def _read_glb_accessor(document, binary_chunk, accessor_index):
+        accessor = document["accessors"][accessor_index]
+        buffer_view = document["bufferViews"][accessor["bufferView"]]
+        component_type = accessor["componentType"]
+        accessor_type = accessor["type"]
+        count = accessor["count"]
+        component_count = {
+            "SCALAR": 1,
+            "VEC2": 2,
+            "VEC3": 3,
+            "VEC4": 4,
+            "MAT4": 16,
+        }[accessor_type]
+        dtype = {
+            5120: numpy.int8,
+            5121: numpy.uint8,
+            5122: numpy.int16,
+            5123: numpy.uint16,
+            5125: numpy.uint32,
+            5126: numpy.float32,
+        }[component_type]
+
+        component_size = numpy.dtype(dtype).itemsize
+        element_size = component_size * component_count
+        byte_offset = buffer_view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+        byte_stride = buffer_view.get("byteStride", element_size)
+
+        if byte_stride == element_size:
+            flat = numpy.frombuffer(binary_chunk, dtype=dtype, count=count * component_count, offset=byte_offset)
+            return flat.reshape(count, component_count).astype(numpy.float32)
+
+        values = numpy.empty((count, component_count), dtype=numpy.float32)
+        for index in range(count):
+            start = byte_offset + index * byte_stride
+            chunk = binary_chunk[start:start + element_size]
+            values[index] = numpy.frombuffer(chunk, dtype=dtype, count=component_count).astype(numpy.float32)
+        return values
+
+
+    @staticmethod
+    def _read_glb_texture_image(document, binary_chunk, texture_index):
+        if texture_index is None:
+            return None
+
+        texture = document["textures"][texture_index]
+        image_def = document["images"][texture["source"]]
+
+        if "bufferView" in image_def:
+            buffer_view = document["bufferViews"][image_def["bufferView"]]
+            byte_offset = buffer_view.get("byteOffset", 0)
+            byte_length = buffer_view["byteLength"]
+            image_bytes = binary_chunk[byte_offset:byte_offset + byte_length]
+            return Image.open(BytesIO(image_bytes)).convert("RGBA")
+
+        if "uri" in image_def:
+            image_path = Path(image_def["uri"])
+            return Image.open(image_path).convert("RGBA")
+
+        return None
 
 
     @staticmethod

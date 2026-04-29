@@ -3,6 +3,7 @@ from typing import Union
 import arcade
 import numpy
 import pyrr
+from PIL import Image
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileProgram, compileShader
 
@@ -28,13 +29,15 @@ class Shader:
 class Material:
     def __init__(
         self,
-        file_path_diffuse: Union[str, arcade.Texture],
-        file_path_specular: Union[str, arcade.Texture],
-        file_path_normal: Union[str, arcade.Texture],
+        file_path_diffuse: Union[str, arcade.Texture, Image.Image],
+        file_path_specular: Union[str, arcade.Texture, Image.Image],
+        file_path_normal: Union[str, arcade.Texture, Image.Image],
     ) -> None:
         def load_image(source):
             if isinstance(source, str):
                 return arcade.load_texture(source).image.convert("RGBA")
+            if isinstance(source, Image.Image):
+                return source.convert("RGBA")
 
             return source.image.convert("RGBA")
 
