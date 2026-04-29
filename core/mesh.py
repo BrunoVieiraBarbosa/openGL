@@ -276,6 +276,7 @@ class Mesh:
         vertex_size=8,
         target_size=3.5,
         normalize=True,
+        rotation_degrees=(0.0, 0.0, 0.0),
     ):
         source_path = Path(file_name)
         cache_file = Mesh._get_prepared_cache_path(
@@ -285,6 +286,7 @@ class Mesh:
             vertex_size=vertex_size,
             target_size=target_size,
             normalize=normalize,
+            rotation_degrees=rotation_degrees,
         )
         source_stat = source_path.stat()
 
@@ -296,6 +298,8 @@ class Mesh:
         vertices = Mesh.load_obj(file_name)
         if invert_texcoord:
             vertices = Mesh.invert_s_or_t(vertices, st_pos, vertex_size)
+        if rotation_degrees != (0.0, 0.0, 0.0):
+            vertices = Mesh.rotate_vertices(vertices, rotation_degrees=rotation_degrees, vertex_size=vertex_size)
         if normalize:
             vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
@@ -384,6 +388,45 @@ class Mesh:
             normalized[index + 2] = float((normalized[index + 2] - min_z) * scale)
 
         return normalized
+
+
+    @staticmethod
+    def rotate_vertices(vertices, rotation_degrees=(0.0, 0.0, 0.0), vertex_size=8):
+        if not vertices:
+            return vertices
+
+        rotation_x, rotation_y, rotation_z = rotation_degrees
+        rotation_matrix = pyrr.matrix44.create_identity(dtype=numpy.float32)
+        rotation_matrix = pyrr.matrix44.multiply(
+            rotation_matrix,
+            pyrr.matrix44.create_from_x_rotation(theta=numpy.radians(rotation_x), dtype=numpy.float32),
+        )
+        rotation_matrix = pyrr.matrix44.multiply(
+            rotation_matrix,
+            pyrr.matrix44.create_from_y_rotation(theta=numpy.radians(rotation_y), dtype=numpy.float32),
+        )
+        rotation_matrix = pyrr.matrix44.multiply(
+            rotation_matrix,
+            pyrr.matrix44.create_from_z_rotation(theta=numpy.radians(rotation_z), dtype=numpy.float32),
+        )
+
+        rotated = list(vertices)
+        for index in range(0, len(rotated), vertex_size):
+            position = numpy.array([rotated[index], rotated[index + 1], rotated[index + 2], 1.0], dtype=numpy.float32)
+            rotated_position = pyrr.matrix44.apply_to_vector(rotation_matrix, position)
+            rotated[index] = float(rotated_position[0])
+            rotated[index + 1] = float(rotated_position[1])
+            rotated[index + 2] = float(rotated_position[2])
+
+            normal_index = index + 5
+            if normal_index + 2 < index + vertex_size:
+                normal = numpy.array([rotated[normal_index], rotated[normal_index + 1], rotated[normal_index + 2], 0.0], dtype=numpy.float32)
+                rotated_normal = pyrr.matrix44.apply_to_vector(rotation_matrix, normal)
+                rotated[normal_index] = float(rotated_normal[0])
+                rotated[normal_index + 1] = float(rotated_normal[1])
+                rotated[normal_index + 2] = float(rotated_normal[2])
+
+        return rotated
 
 
     @staticmethod
@@ -578,6 +621,20 @@ class Mesh:
         model = pyrr.matrix44.multiply(scale_matrix, rotation_matrix)
         return pyrr.matrix44.multiply(model, translation_matrix)
 
+    def _compose_rotation_matrix(self):
+        model = pyrr.matrix44.multiply(
+            self.identity,
+            pyrr.matrix44.create_from_x_rotation(theta=numpy.radians(self.rotation[0]), dtype=numpy.float32),
+        )
+        model = pyrr.matrix44.multiply(
+            model,
+            pyrr.matrix44.create_from_y_rotation(theta=numpy.radians(self.rotation[1]), dtype=numpy.float32),
+        )
+        return pyrr.matrix44.multiply(
+            model,
+            pyrr.matrix44.create_from_z_rotation(theta=numpy.radians(self.rotation[2]), dtype=numpy.float32),
+        )
+
 
     def translate(self, model):
         self.model = self._build_model_matrix(model)
@@ -615,10 +672,16 @@ class Mesh:
         self.rotation[0] = (self.rotation[0] + angle) % 360
         self.rotation[1] = (self.rotation[1] + angle) % 360
         self.rotation[2] = (self.rotation[2] + angle) % 360
-        model = pyrr.matrix44.multiply(self.identity, pyrr.matrix44.create_from_x_rotation(theta=numpy.radians(self.rotation[0]), dtype=numpy.float32))
-        model = pyrr.matrix44.multiply(model, pyrr.matrix44.create_from_y_rotation(theta=numpy.radians(self.rotation[1]), dtype=numpy.float32))
-        model = pyrr.matrix44.multiply(model, pyrr.matrix44.create_from_z_rotation(theta=numpy.radians(self.rotation[2]), dtype=numpy.float32))
-        self.translate(model)
+        self.translate(self._compose_rotation_matrix())
+
+    def set_rotation(self, x=None, y=None, z=None):
+        if x is not None:
+            self.rotation[0] = float(x) % 360
+        if y is not None:
+            self.rotation[1] = float(y) % 360
+        if z is not None:
+            self.rotation[2] = float(z) % 360
+        self.translate(self._compose_rotation_matrix())
 
 
     def draw(self):

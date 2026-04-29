@@ -146,19 +146,37 @@ class GameWindow(App):
             cube.position[2] = self.terrain_height(cube.position[0], cube.position[1]) + 0.18
             cube.set_collider(mode="circle", radius_scale=1.0, radius_padding=0.08, height_padding=0.08)
 
-        self.camera = CameraFirstPerson([10, -14, self.terrain_height(10, -14) + 1.7])
+        player_start = numpy.array([10.0, -14.0, self.terrain_height(10, -14)], dtype=numpy.float32)
+        player_vertices = Mesh.load_obj_prepared(
+            os.path.join("obj", "PlayerTemp.obj"),
+            invert_texcoord=True,
+            st_pos=4,
+            vertex_size=8,
+            target_size=1.9,
+            rotation_degrees=(-90.0, 0.0, 0.0),
+        )
+        self.player_mesh = Mesh(self.shaders[0], self.texture, player_start.copy(), player_vertices)
+        self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
+
+        self.camera = CameraThirdPerson(player_start, distance=5.6, height=1.55)
         self.camera.theta = 72
-        self.camera.phi = -8
+        self.camera.phi = -20
         self.sky.position = self.camera
         static_colliders = self.scene_meshes + self.cubes
-        self.player = PlayerFirstPerson(
+        self.player = PlayerThirdPerson(
             self.camera,
             [self.shaders[0], self.shaders[1]],
+            self.player_mesh,
+            player_start,
+            mesh_rotation_offset=(0.0, 0.0, 0.0),
+            mesh_position_offset=(0.0, 0.0, 0.0),
+            mesh_heading_offset=0.0,
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
             ground_height_fn=self.terrain_height,
             terrain_contains_fn=self.terrain_contains,
         )
+        self.player.update(0.0)
         self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
 
     def _cleanup(self):
@@ -172,6 +190,7 @@ class GameWindow(App):
         self.texture2.destroy()
         self.ground_texture.destroy()
         self.terrain.destroy()
+        self.player_mesh.destroy()
         [x.destroy() for x in self.scene_meshes]
         [x.destroy() for x in self.cubes]
         [x.destroy() for x in self.lampada]
@@ -184,6 +203,7 @@ class GameWindow(App):
         self.sky.draw()
         glDepthMask(GL_TRUE)
         self.terrain.draw()
+        self.player_mesh.draw()
         [x.draw() for x in self.cubes]
         [x.draw() for x in self.scene_meshes]
         [x.draw() for x in self.lampada]

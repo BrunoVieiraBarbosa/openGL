@@ -86,14 +86,40 @@ class Material:
         glDeleteTextures(2, (self.diffuse_texture, self.specular_texture, self.normal_texture))
 
 
-class CameraFirstPerson:
+class Camera:
     def __init__(self, position) -> None:
         self.position = numpy.array(position, dtype=numpy.float32)
         self.forward = numpy.array([0, 0, 0], dtype=numpy.float32)
-        self.theta = 0
-        self.phi = 0
         self.move_speed = 1
         self.global_up = numpy.array([0, 0, 1], dtype=numpy.float32)
+
+    def apply_view(self, shaders, target):
+        target = numpy.array(target, dtype=numpy.float32)
+        self.forward = target - self.position
+        forward_norm = max(float(numpy.linalg.norm(self.forward)), 1e-6)
+        self.forward /= forward_norm
+        right = pyrr.vector3.cross(self.global_up, self.forward)
+        right_norm = max(float(numpy.linalg.norm(right)), 1e-6)
+        right /= right_norm
+        up = pyrr.vector3.cross(self.forward, right)
+        look_at_matrix = pyrr.matrix44.create_look_at(
+            self.position,
+            target,
+            up,
+            dtype=numpy.float32,
+        )
+
+        for shader in shaders:
+            glUseProgram(shader)
+            glUniformMatrix4fv(glGetUniformLocation(shader, "view"), 1, GL_FALSE, look_at_matrix)
+            glUniform3fv(glGetUniformLocation(shader, "cameraPos"), 1, self.position)
+
+
+class CameraFirstPerson(Camera):
+    def __init__(self, position) -> None:
+        super().__init__(position)
+        self.theta = 0
+        self.phi = 0
 
     def move(self, direction, amount):
         walk_direction = numpy.radians((direction + self.theta) % 360)
@@ -110,24 +136,51 @@ class CameraFirstPerson:
         camera_sin = numpy.sin(theta, dtype=numpy.float32)
         camera_cos2 = numpy.cos(phi, dtype=numpy.float32)
         camera_sin2 = numpy.sin(phi, dtype=numpy.float32)
-
-        self.forward[0] = camera_cos * camera_cos2
-        self.forward[1] = camera_sin * camera_cos2
-        self.forward[2] = camera_sin2
-
-        right = pyrr.vector3.cross(self.global_up, self.forward)
-        up = pyrr.vector3.cross(self.forward, right)
-        look_at_matrix = pyrr.matrix44.create_look_at(
-            self.position,
-            self.position + self.forward,
-            up,
+        look_target = self.position + numpy.array(
+            [
+                camera_cos * camera_cos2,
+                camera_sin * camera_cos2,
+                camera_sin2,
+            ],
             dtype=numpy.float32,
         )
+        self.apply_view(shaders, look_target)
 
-        for shader in shaders:
-            glUseProgram(shader)
-            glUniformMatrix4fv(glGetUniformLocation(shader, "view"), 1, GL_FALSE, look_at_matrix)
-            glUniform3fv(glGetUniformLocation(shader, "cameraPos"), 1, self.position)
+
+class CameraThirdPerson(Camera):
+    def __init__(self, focus_position, distance=5.8, height=1.6) -> None:
+        super().__init__(focus_position)
+        self.focus_position = numpy.array(focus_position, dtype=numpy.float32)
+        self.theta = 70
+        self.phi = -22
+        self.distance = distance
+        self.height = height
+        self.min_distance = 2.4
+        self.min_phi = -55
+        self.max_phi = 20
+
+    def increment_direction(self, horizontal, vertical):
+        self.theta = (self.theta + horizontal) % 360
+        self.phi = min(max(self.phi + vertical, self.min_phi), self.max_phi)
+
+    def update_focus(self, focus_position):
+        self.focus_position = numpy.array(focus_position, dtype=numpy.float32)
+
+    def update(self, shaders):
+        theta = numpy.radians(self.theta)
+        phi = numpy.radians(self.phi)
+        orbit_forward = numpy.array(
+            [
+                numpy.cos(theta, dtype=numpy.float32) * numpy.cos(phi, dtype=numpy.float32),
+                numpy.sin(theta, dtype=numpy.float32) * numpy.cos(phi, dtype=numpy.float32),
+                numpy.sin(phi, dtype=numpy.float32),
+            ],
+            dtype=numpy.float32,
+        )
+        target = self.focus_position + numpy.array([0.0, 0.0, self.height], dtype=numpy.float32)
+        desired_position = target - orbit_forward * self.distance
+        self.position = desired_position.astype(numpy.float32)
+        self.apply_view(shaders, target)
 
 
 class App(arcade.Window):
