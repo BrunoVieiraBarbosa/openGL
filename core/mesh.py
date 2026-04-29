@@ -363,9 +363,19 @@ class Mesh:
 
 
 class MeshRGB:
-    def __init__(self, shader, position, vertices=None, color = [1, 1, 1]) -> None:
+    def __init__(
+        self,
+        shader,
+        position,
+        vertices=None,
+        color=[1, 1, 1],
+        scale=1.0,
+        billboard_target=None,
+    ) -> None:
         self.shader = shader
         self.position = position
+        self.scale = scale
+        self.billboard_target = billboard_target
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
         glUseProgram(self.shader)
@@ -427,12 +437,109 @@ class MeshRGB:
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
 
 
+    @staticmethod
+    def create_gradient_box(size=1.0, top_color=(0.55, 0.78, 0.98), bottom_color=(0.9, 0.82, 0.68)):
+        half = size / 2
+        top = list(top_color)
+        bottom = list(bottom_color)
+        return (
+            -half,  half, -half, *top,
+             half,  half,  half, *top,
+             half,  half, -half, *top,
+             half,  half,  half, *top,
+            -half, -half,  half, *bottom,
+             half, -half,  half, *bottom,
+            -half,  half,  half, *top,
+            -half, -half, -half, *bottom,
+            -half, -half,  half, *bottom,
+             half, -half, -half, *bottom,
+            -half, -half,  half, *bottom,
+            -half, -half, -half, *bottom,
+             half,  half, -half, *top,
+             half, -half,  half, *bottom,
+             half, -half, -half, *bottom,
+            -half,  half, -half, *top,
+             half, -half, -half, *bottom,
+            -half, -half, -half, *bottom,
+            -half,  half, -half, *top,
+            -half,  half,  half, *top,
+             half,  half,  half, *top,
+             half,  half,  half, *top,
+            -half,  half,  half, *top,
+            -half, -half,  half, *bottom,
+            -half,  half,  half, *top,
+            -half,  half, -half, *top,
+            -half, -half, -half, *bottom,
+             half, -half, -half, *bottom,
+             half, -half,  half, *bottom,
+            -half, -half,  half, *bottom,
+             half,  half, -half, *top,
+             half,  half,  half, *top,
+             half, -half,  half, *bottom,
+            -half,  half, -half, *top,
+             half,  half, -half, *top,
+             half, -half, -half, *bottom,
+        )
+
+
+    @staticmethod
+    def create_disc(radius=1.0, segments=24, color=(1.0, 0.9, 0.65)):
+        vertices = []
+        center = [0.0, 0.0, 0.0, *color]
+
+        for index in range(segments):
+            angle0 = (2 * numpy.pi * index) / segments
+            angle1 = (2 * numpy.pi * (index + 1)) / segments
+            p0 = [numpy.cos(angle0) * radius, numpy.sin(angle0) * radius, 0.0, *color]
+            p1 = [numpy.cos(angle1) * radius, numpy.sin(angle1) * radius, 0.0, *color]
+            vertices.extend(center)
+            vertices.extend(p0)
+            vertices.extend(p1)
+
+        return tuple(vertices)
+
+
     def draw(self):
         glUseProgram(self.shader)
-        if type(self.model) == type(None):
-            self.model = pyrr.matrix44.create_from_translation(vec=numpy.array(self.position.position), dtype=numpy.float32)
+        position = self.position.position if hasattr(self.position, "position") else self.position
+        position = numpy.array(position, dtype=numpy.float32)
 
-        self.model = pyrr.matrix44.multiply(self.identity, pyrr.matrix44.create_from_translation(vec=numpy.array(self.position.position), dtype=numpy.float32))
+        if self.billboard_target is not None:
+            target_position = self.billboard_target.position if hasattr(self.billboard_target, "position") else self.billboard_target
+            target_position = numpy.array(target_position, dtype=numpy.float32)
+            forward = target_position - position
+            forward_norm = numpy.linalg.norm(forward)
+            if forward_norm < 1e-6:
+                forward = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float32)
+            else:
+                forward = forward / forward_norm
+
+            world_up = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32)
+            if abs(float(numpy.dot(forward, world_up))) > 0.98:
+                world_up = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float32)
+
+            right = numpy.cross(world_up, forward)
+            right = right / max(numpy.linalg.norm(right), 1e-6)
+            up = numpy.cross(forward, right)
+            up = up / max(numpy.linalg.norm(up), 1e-6)
+
+            self.model = numpy.array(
+                [
+                    [right[0] * self.scale, up[0] * self.scale, forward[0] * self.scale, position[0]],
+                    [right[1] * self.scale, up[1] * self.scale, forward[1] * self.scale, position[1]],
+                    [right[2] * self.scale, up[2] * self.scale, forward[2] * self.scale, position[2]],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                dtype=numpy.float32,
+            )
+        else:
+            scale_matrix = pyrr.matrix44.create_from_scale(
+                numpy.array([self.scale, self.scale, self.scale], dtype=numpy.float32),
+                dtype=numpy.float32,
+            )
+            translation_matrix = pyrr.matrix44.create_from_translation(vec=position, dtype=numpy.float32)
+            self.model = pyrr.matrix44.multiply(scale_matrix, translation_matrix)
+
         glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)

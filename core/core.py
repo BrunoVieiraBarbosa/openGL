@@ -142,6 +142,9 @@ class App(arcade.Window):
         )
         self.window_size = size
         self.ambient_color = ambient_color
+        self.fog_color = numpy.array(self.ambient_color[:3], dtype=numpy.float32)
+        self.fog_near = 22.0
+        self.fog_far = 58.0
         self.shaders = []
         glEnable(GL_DEPTH_TEST)
         glClearColor(*self.ambient_color)
@@ -181,6 +184,9 @@ class App(arcade.Window):
             1,
             numpy.array(self.ambient_color[:3], dtype=numpy.float32),
         )
+        glUniform3fv(glGetUniformLocation(self.shaders[0], "fogColor"), 1, self.fog_color)
+        glUniform1f(glGetUniformLocation(self.shaders[0], "fogNear"), self.fog_near)
+        glUniform1f(glGetUniformLocation(self.shaders[0], "fogFar"), self.fog_far)
         glUniform1i(glGetUniformLocation(self.shaders[0], "material.diffuse"), 0)
         glUniform1i(glGetUniformLocation(self.shaders[0], "material.specular"), 1)
         glUniform1i(glGetUniformLocation(self.shaders[0], "material.normal"), 2)

@@ -94,6 +94,9 @@ uniform Material material;
 uniform Light lights[MAX_LIGHT_COUNT];
 uniform vec3 cameraPos;
 uniform vec3 ambient;
+uniform vec3 fogColor;
+uniform float fogNear;
+uniform float fogFar;
 
 layout (location=0) out vec4 color;
 
@@ -108,6 +111,10 @@ void main()
             lightLevel += CalculatePointLight(lights[i], cameraPos, fragmentPos, fragmentNormal, material, fragmentTexCoord, ambient);
         }
     }
+
+    float fogDistance = distance(cameraPos, fragmentPos);
+    float fogFactor = clamp((fogFar - fogDistance) / max(fogFar - fogNear, 0.001), 0.0, 1.0);
+    lightLevel = mix(fogColor, lightLevel, fogFactor);
 
     //return pixel color
 	color = vec4(lightLevel, 1.0);

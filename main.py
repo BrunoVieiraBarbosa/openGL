@@ -2,6 +2,7 @@ import os
 import random
 
 import arcade
+import numpy
 from OpenGL.GL import *
 
 from core.core import *
@@ -13,7 +14,10 @@ from core.utils import *
 class GameWindow(App):
     def __init__(self):
         size = (1280, 720)
-        super().__init__(size, ambient_color=(0.35, 0.35, 0.38, 1.0))
+        super().__init__(size, ambient_color=(0.62, 0.67, 0.73, 1.0))
+        self.fog_color = numpy.array([0.78, 0.79, 0.74], dtype=numpy.float32)
+        self.fog_near = 14.0
+        self.fog_far = 42.0
         self.set_mouse_visible(False)
         self.set_exclusive_mouse(True)
         self.cleaned_up = False
@@ -29,8 +33,8 @@ class GameWindow(App):
             DirectionalLight(
                 [self.shaders[0], self.shaders[1]],
                 [-0.4, -0.8, -1.0],
-                [1.0, 0.97, 0.92],
-                24,
+                [1.0, 0.95, 0.86],
+                30,
                 0,
                 [True, False],
             ),
@@ -49,6 +53,16 @@ class GameWindow(App):
             MeshRGB(self.shaders[1], self.light[1], color=[1, 0.95, 0.8]),
             MeshRGB(self.shaders[1], self.light[2], color=[0.7, 0.85, 1.0]),
         ]
+        self.sky = MeshRGB(
+            self.shaders[1],
+            self.camera if hasattr(self, "camera") else [0, 0, 0],
+            vertices=MeshRGB.create_gradient_box(
+                size=1.0,
+                top_color=(0.40, 0.64, 0.93),
+                bottom_color=(0.96, 0.82, 0.58),
+            ),
+            scale=90.0,
+        )
 
         self.texture = Material(
             os.path.join("textures", "teste.png"),
@@ -61,12 +75,12 @@ class GameWindow(App):
             os.path.join("textures", "box_specular.jpg"),
         )
         self.ground_texture = Material(
-            os.path.join("textures", "wood_leve.jpg"),
-            os.path.join("textures", "wood_leve.jpg"),
+            os.path.join("textures", "block.png"),
+            os.path.join("textures", "block_specular.png"),
             os.path.join("textures", "normal.jpg"),
         )
 
-        ground_vertices = Mesh.create_plane(width=52.0, depth=38.0, uv_scale=12.0)
+        ground_vertices = Mesh.create_plane(width=52.0, depth=38.0, uv_scale=3.5)
         self.terrain = Mesh(self.shaders[0], self.ground_texture, [10, 4, -0.02], ground_vertices)
 
         obj_scene = [
@@ -93,13 +107,14 @@ class GameWindow(App):
                 self.shaders[0],
                 self.texture2,
                 [random.randint(-6, 30), random.randint(-8, 16), 0.18],
-                scale=0.22,
+                scale=0.18,
             )
-            for _ in range(14)
+            for _ in range(10)
         ]
         self.camera = CameraFirstPerson([10, -14, 1.7])
         self.camera.theta = 72
         self.camera.phi = -8
+        self.sky.position = self.camera
         static_colliders = self.scene_meshes + self.cubes
         self.player = PlayerFirstPerson(
             self.camera,
@@ -123,10 +138,14 @@ class GameWindow(App):
         [x.destroy() for x in self.scene_meshes]
         [x.destroy() for x in self.cubes]
         [x.destroy() for x in self.lampada]
+        self.sky.destroy()
 
     def on_draw(self):
         self.clear()
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glDepthMask(GL_FALSE)
+        self.sky.draw()
+        glDepthMask(GL_TRUE)
         self.terrain.draw()
         [x.draw() for x in self.cubes]
         [x.draw() for x in self.scene_meshes]
