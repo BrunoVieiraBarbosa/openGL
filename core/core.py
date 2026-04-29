@@ -27,6 +27,17 @@ class Shader:
 
 
 class Material:
+    @staticmethod
+    def _solid_image(color):
+        return Image.new("RGBA", (1, 1), color)
+
+    @classmethod
+    def from_compatible_glb_images(cls, glb_images):
+        diffuse = glb_images.get("diffuse") or cls._solid_image((255, 255, 255, 255))
+        specular = glb_images.get("specular") or cls._solid_image((64, 64, 64, 255))
+        normal = glb_images.get("normal") or cls._solid_image((128, 128, 255, 255))
+        return cls(diffuse, specular, normal)
+
     def __init__(
         self,
         file_path_diffuse: Union[str, arcade.Texture, Image.Image],
@@ -86,7 +97,7 @@ class Material:
         glBindTexture(GL_TEXTURE_2D, self.normal_texture)
 
     def destroy(self):
-        glDeleteTextures(2, (self.diffuse_texture, self.specular_texture, self.normal_texture))
+        glDeleteTextures(3, (self.diffuse_texture, self.specular_texture, self.normal_texture))
 
 
 class Camera:

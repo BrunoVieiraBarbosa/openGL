@@ -129,6 +129,7 @@ class PlayerThirdPerson(PlayerController):
         shaders,
         player_mesh,
         position,
+        visual_meshes=None,
         mesh_rotation_offset=None,
         mesh_position_offset=None,
         mesh_heading_offset=-90.0,
@@ -146,6 +147,7 @@ class PlayerThirdPerson(PlayerController):
             terrain_contains_fn=terrain_contains_fn,
         )
         self.player_mesh = player_mesh
+        self.visual_meshes = visual_meshes or [player_mesh]
         self.position = numpy.array(position, dtype=numpy.float32)
         self.mesh_rotation_offset = mesh_rotation_offset or (0.0, 0.0, 0.0)
         self.mesh_position_offset = numpy.array(mesh_position_offset or (0.0, 0.0, 0.0), dtype=numpy.float32)
@@ -221,12 +223,13 @@ class PlayerThirdPerson(PlayerController):
 
     def _sync_visuals(self):
         mesh_position = self.position + self.mesh_position_offset
-        self.player_mesh.position[0] = float(mesh_position[0])
-        self.player_mesh.position[1] = float(mesh_position[1])
-        self.player_mesh.position[2] = float(mesh_position[2])
         rotation_x, rotation_y, rotation_z = self.mesh_rotation_offset
-        self.player_mesh.set_rotation(
-            x=rotation_x,
-            y=rotation_y,
-            z=rotation_z - self.facing_yaw + self.mesh_heading_offset,
-        )
+        for mesh in self.visual_meshes:
+            mesh.position[0] = float(mesh_position[0])
+            mesh.position[1] = float(mesh_position[1])
+            mesh.position[2] = float(mesh_position[2])
+            mesh.set_rotation(
+                x=rotation_x,
+                y=rotation_y,
+                z=rotation_z - self.facing_yaw + self.mesh_heading_offset,
+            )

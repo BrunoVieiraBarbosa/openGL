@@ -47,6 +47,11 @@ class TerrainGridSampler:
                 vertices.append((float(values[1]), float(values[2]), float(values[3])))
         return cls(vertices)
 
+    @classmethod
+    def from_glb(cls, file_name):
+        vertices = Mesh.extract_glb_unique_positions(file_name)
+        return cls(vertices)
+
     def sample_height(self, x, y):
         local_x = float(x)
         local_y = float(y)
@@ -120,6 +125,8 @@ class TerrainGridSampler:
 class Mesh:
     CACHE_DIR = Path(".cache") / "obj"
     PREPARED_CACHE_DIR = Path(".cache") / "obj_prepared"
+    PREPARED_SUBMESH_CACHE_DIR = Path(".cache") / "glb_prepared"
+    MATERIAL_CACHE_DIR = Path(".cache") / "glb_materials"
 
     def __init__(self, shader, material, position, vertices: Optional[tuple] = None, faces: Optional[tuple] = None, scale=1.0) -> None:
         self.material = material
@@ -190,7 +197,10 @@ class Mesh:
         if faces != None:
             self.faces = faces
 
-        self.vertex_count = len(self.vertices)//8
+        if len(self.vertices) % 11 != 0:
+            self.vertices = Mesh.append_tangents(self.vertices, vertex_size=8)
+        self.vertex_size = 11
+        self.vertex_count = len(self.vertices)//self.vertex_size
         self.vertices = numpy.array(self.vertices, dtype=numpy.float32)
         self.local_bounds = self._compute_local_bounds()
 
@@ -201,13 +211,17 @@ class Mesh:
         glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STATIC_DRAW)
 
         glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(0))
+        stride = self.vertex_size * 4
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
 
         glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(12))
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
 
         glEnableVertexAttribArray(2)
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(20))
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(20))
+
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(32))
 
     @staticmethod
     def load_obj(file_name):
@@ -284,46 +298,57 @@ class Mesh:
             print(f'cache carregado: {file_name}')
             return cached_vertices
 
-        document, binary_chunk = Mesh._read_glb(source_path)
         vertices = []
-        for mesh in document.get("meshes", []):
-            for primitive in mesh.get("primitives", []):
-                if primitive.get("mode", 4) != 4:
-                    continue
-
-                attributes = primitive.get("attributes", {})
-                positions = Mesh._read_glb_accessor(document, binary_chunk, attributes["POSITION"])
-                texcoords = None
-                normals = None
-                if "TEXCOORD_0" in attributes:
-                    texcoords = Mesh._read_glb_accessor(document, binary_chunk, attributes["TEXCOORD_0"])
-                if "NORMAL" in attributes:
-                    normals = Mesh._read_glb_accessor(document, binary_chunk, attributes["NORMAL"])
-
-                if "indices" in primitive:
-                    indices = Mesh._read_glb_accessor(document, binary_chunk, primitive["indices"]).reshape(-1)
-                else:
-                    indices = numpy.arange(len(positions), dtype=numpy.int32)
-
-                for vertex_index in indices:
-                    position = positions[int(vertex_index)]
-                    vertices.extend((float(position[0]), float(position[1]), float(position[2])))
-
-                    if texcoords is not None:
-                        uv = texcoords[int(vertex_index)]
-                        vertices.extend((float(uv[0]), float(uv[1])))
-                    else:
-                        vertices.extend((0.0, 0.0))
-
-                    if normals is not None:
-                        normal = normals[int(vertex_index)]
-                        vertices.extend((float(normal[0]), float(normal[1]), float(normal[2])))
-                    else:
-                        vertices.extend((0.0, 0.0, 1.0))
+        for submesh in Mesh.load_glb_submeshes(file_name):
+            vertices.extend(submesh["vertices"])
 
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
         print(f'modelo GLB carregado: {file_name}')
         return vertices
+
+
+    @staticmethod
+    def load_glb_submeshes(file_name):
+        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        nodes = document.get("nodes", [])
+        scene_index = document.get("scene", 0)
+        scenes = document.get("scenes", [])
+        if scenes and 0 <= scene_index < len(scenes):
+            root_nodes = scenes[scene_index].get("nodes", [])
+        else:
+            root_nodes = list(range(len(nodes)))
+
+        submeshes = []
+        identity = numpy.identity(4, dtype=numpy.float32)
+
+        def visit(node_index, parent_matrix):
+            node = nodes[node_index]
+            local_matrix = Mesh._glb_node_matrix(node)
+            world_matrix = numpy.matmul(parent_matrix, local_matrix)
+
+            if "mesh" in node:
+                mesh_index = node["mesh"]
+                mesh_def = document["meshes"][mesh_index]
+                for primitive_index, primitive in enumerate(mesh_def.get("primitives", [])):
+                    if primitive.get("mode", 4) != 4:
+                        continue
+                    vertices = Mesh._build_glb_primitive_vertices(document, binary_chunk, primitive, world_matrix)
+                    material_index = primitive.get("material")
+                    submeshes.append(
+                        {
+                            "name": f'{mesh_def.get("name", f"mesh_{mesh_index}")}_primitive_{primitive_index}',
+                            "material_index": -1 if material_index is None else int(material_index),
+                            "vertices": vertices,
+                        }
+                    )
+
+            for child_index in node.get("children", []):
+                visit(child_index, world_matrix)
+
+        for root_index in root_nodes:
+            visit(root_index, identity)
+
+        return submeshes
 
 
     @staticmethod
@@ -360,8 +385,69 @@ class Mesh:
             vertices = Mesh.rotate_vertices(vertices, rotation_degrees=rotation_degrees, vertex_size=vertex_size)
         if normalize:
             vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
+        vertices = Mesh.append_tangents(vertices, vertex_size=vertex_size)
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
         return vertices
+
+
+    @staticmethod
+    def load_glb_submeshes_prepared(
+        file_name,
+        invert_texcoord=False,
+        st_pos=4,
+        vertex_size=8,
+        target_size=3.5,
+        normalize=True,
+        rotation_degrees=(0.0, 0.0, 0.0),
+    ):
+        source_path = Path(file_name)
+        cache_file = Mesh._get_prepared_submesh_cache_path(
+            source_path,
+            invert_texcoord=invert_texcoord,
+            st_pos=st_pos,
+            vertex_size=vertex_size,
+            target_size=target_size,
+            normalize=normalize,
+            rotation_degrees=rotation_degrees,
+        )
+        source_stat = source_path.stat()
+
+        cached_submeshes = Mesh._load_cached_submeshes(cache_file, source_stat)
+        if cached_submeshes is not None:
+            print(f'cache preparado carregado: {file_name}')
+            return cached_submeshes
+
+        prepared = Mesh.load_glb_submeshes(file_name)
+        vertex_batches = [list(submesh["vertices"]) for submesh in prepared]
+
+        if invert_texcoord:
+            vertex_batches = [
+                Mesh.invert_s_or_t(batch, st_pos, vertex_size)
+                for batch in vertex_batches
+            ]
+        if rotation_degrees != (0.0, 0.0, 0.0):
+            vertex_batches = [
+                Mesh.rotate_vertices(batch, rotation_degrees=rotation_degrees, vertex_size=vertex_size)
+                for batch in vertex_batches
+            ]
+        if normalize:
+            vertex_batches = Mesh.normalize_vertex_batches(
+                vertex_batches,
+                vertex_size=vertex_size,
+                target_size=target_size,
+            )
+
+        results = []
+        for submesh, vertices in zip(prepared, vertex_batches):
+            results.append(
+                {
+                    "name": submesh["name"],
+                    "material_index": submesh["material_index"],
+                    "vertices": Mesh.append_tangents(vertices, vertex_size=vertex_size),
+                }
+            )
+        Mesh._store_cached_submeshes(cache_file, source_stat, results)
+        return results
 
 
     @staticmethod
@@ -398,13 +484,23 @@ class Mesh:
             vertices = Mesh.rotate_vertices(vertices, rotation_degrees=rotation_degrees, vertex_size=vertex_size)
         if normalize:
             vertices = Mesh.normalize_vertices(vertices, vertex_size=vertex_size, target_size=target_size)
+        vertices = Mesh.append_tangents(vertices, vertex_size=vertex_size)
         Mesh._store_cached_vertices(cache_file, source_stat, vertices)
         return vertices
 
 
     @staticmethod
     def load_glb_material_images(file_name, material_index=0):
-        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        source_path = Path(file_name)
+        cache_file = Mesh._get_material_cache_path(source_path, material_index)
+        source_stat = source_path.stat()
+
+        cached_images = Mesh._load_cached_material_images(cache_file, source_stat)
+        if cached_images is not None:
+            print(f'cache material carregado: {file_name} [{material_index}]')
+            return cached_images
+
+        document, binary_chunk = Mesh._read_glb(source_path)
         materials = document.get("materials", [])
         if material_index >= len(materials):
             raise ValueError(f"GLB material index {material_index} out of range for {file_name}")
@@ -413,15 +509,27 @@ class Mesh:
         pbr = material.get("pbrMetallicRoughness", {})
 
         diffuse = Mesh._read_glb_texture_image(document, binary_chunk, pbr.get("baseColorTexture", {}).get("index"))
+        if diffuse is None:
+            diffuse_factor = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
+            diffuse = Image.new("RGBA", (1, 1), Mesh._factor_to_rgba(diffuse_factor))
+
         specular_info = material.get("extensions", {}).get("KHR_materials_specular", {})
         specular = Mesh._read_glb_texture_image(document, binary_chunk, specular_info.get("specularColorTexture", {}).get("index"))
+        if specular is None:
+            specular_factor = float(specular_info.get("specularFactor", 1.0))
+            specular_color = specular_info.get("specularColorFactor", [1.0, 1.0, 1.0])
+            specular_rgb = [value * specular_factor for value in specular_color]
+            specular = Image.new("RGBA", (1, 1), Mesh._factor_to_rgba([*specular_rgb, 1.0]))
+
         normal = Mesh._read_glb_texture_image(document, binary_chunk, material.get("normalTexture", {}).get("index"))
 
-        return {
+        images = {
             "diffuse": diffuse,
             "specular": specular,
             "normal": normal,
         }
+        Mesh._store_cached_material_images(cache_file, source_stat, images)
+        return images
 
 
     @staticmethod
@@ -442,6 +550,25 @@ class Mesh:
 
 
     @staticmethod
+    def _get_prepared_submesh_cache_path(source_path: Path, **config) -> Path:
+        Mesh.PREPARED_SUBMESH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        config_key = "|".join(f"{key}={config[key]}" for key in sorted(config))
+        cache_key = hashlib.sha1(
+            f"{source_path.resolve()}|submeshes|{config_key}".encode("utf-8")
+        ).hexdigest()[:12]
+        return Mesh.PREPARED_SUBMESH_CACHE_DIR / f"{source_path.stem}.{cache_key}.npz"
+
+
+    @staticmethod
+    def _get_material_cache_path(source_path: Path, material_index: int) -> Path:
+        Mesh.MATERIAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha1(
+            f"{source_path.resolve()}|material={material_index}|v2".encode("utf-8")
+        ).hexdigest()[:12]
+        return Mesh.MATERIAL_CACHE_DIR / f"{source_path.stem}.{cache_key}.npz"
+
+
+    @staticmethod
     def _load_cached_vertices(cache_file: Path, source_stat):
         if not cache_file.exists():
             return None
@@ -459,12 +586,142 @@ class Mesh:
 
 
     @staticmethod
+    def _load_cached_submeshes(cache_file: Path, source_stat):
+        if not cache_file.exists():
+            return None
+
+        try:
+            with numpy.load(cache_file, allow_pickle=False) as cache_data:
+                cached_mtime_ns = int(cache_data["mtime_ns"][0])
+                cached_size = int(cache_data["file_size"][0])
+                if cached_mtime_ns != source_stat.st_mtime_ns or cached_size != source_stat.st_size:
+                    return None
+
+                names = cache_data["names"].tolist()
+                material_indices = cache_data["material_indices"].astype(numpy.int32).tolist()
+                vertices = cache_data["vertices"].astype(numpy.float32)
+                offsets = cache_data["offsets"].astype(numpy.int64)
+
+                submeshes = []
+                for index, start in enumerate(offsets[:-1]):
+                    end = offsets[index + 1]
+                    submeshes.append(
+                        {
+                            "name": str(names[index]),
+                            "material_index": int(material_indices[index]),
+                            "vertices": vertices[start:end].tolist(),
+                        }
+                    )
+                return submeshes
+        except (OSError, KeyError, ValueError):
+            return None
+
+
+    @staticmethod
+    def _load_cached_material_images(cache_file: Path, source_stat):
+        if not cache_file.exists():
+            return None
+
+        try:
+            with numpy.load(cache_file, allow_pickle=False) as cache_data:
+                cached_mtime_ns = int(cache_data["mtime_ns"][0])
+                cached_size = int(cache_data["file_size"][0])
+                if cached_mtime_ns != source_stat.st_mtime_ns or cached_size != source_stat.st_size:
+                    return None
+
+                return {
+                    "diffuse": Mesh._decode_cached_image(cache_data, "diffuse"),
+                    "specular": Mesh._decode_cached_image(cache_data, "specular"),
+                    "normal": Mesh._decode_cached_image(cache_data, "normal"),
+                }
+        except (OSError, KeyError, ValueError):
+            return None
+
+
+    @staticmethod
     def _store_cached_vertices(cache_file: Path, source_stat, vertices):
         numpy.savez_compressed(
             cache_file,
             vertices=numpy.array(vertices, dtype=numpy.float32),
             mtime_ns=numpy.array([source_stat.st_mtime_ns], dtype=numpy.int64),
             file_size=numpy.array([source_stat.st_size], dtype=numpy.int64),
+        )
+
+
+    @staticmethod
+    def _store_cached_submeshes(cache_file: Path, source_stat, submeshes):
+        names = []
+        material_indices = []
+        offsets = [0]
+        flat_vertices = []
+
+        for submesh in submeshes:
+            names.append(submesh["name"])
+            material_indices.append(int(submesh["material_index"]))
+            flat_vertices.extend(submesh["vertices"])
+            offsets.append(len(flat_vertices))
+
+        numpy.savez_compressed(
+            cache_file,
+            names=numpy.array(names),
+            material_indices=numpy.array(material_indices, dtype=numpy.int32),
+            vertices=numpy.array(flat_vertices, dtype=numpy.float32),
+            offsets=numpy.array(offsets, dtype=numpy.int64),
+            mtime_ns=numpy.array([source_stat.st_mtime_ns], dtype=numpy.int64),
+            file_size=numpy.array([source_stat.st_size], dtype=numpy.int64),
+        )
+
+
+    @staticmethod
+    def _store_cached_material_images(cache_file: Path, source_stat, images):
+        diffuse_data = Mesh._encode_cached_image(images.get("diffuse"))
+        specular_data = Mesh._encode_cached_image(images.get("specular"))
+        normal_data = Mesh._encode_cached_image(images.get("normal"))
+
+        numpy.savez_compressed(
+            cache_file,
+            diffuse_pixels=diffuse_data["pixels"],
+            diffuse_size=diffuse_data["size"],
+            specular_pixels=specular_data["pixels"],
+            specular_size=specular_data["size"],
+            normal_pixels=normal_data["pixels"],
+            normal_size=normal_data["size"],
+            mtime_ns=numpy.array([source_stat.st_mtime_ns], dtype=numpy.int64),
+            file_size=numpy.array([source_stat.st_size], dtype=numpy.int64),
+        )
+
+
+    @staticmethod
+    def _encode_cached_image(image):
+        if image is None:
+            return {
+                "pixels": numpy.array([], dtype=numpy.uint8),
+                "size": numpy.array([0, 0], dtype=numpy.int32),
+            }
+
+        rgba = image.convert("RGBA")
+        return {
+            "pixels": numpy.frombuffer(rgba.tobytes(), dtype=numpy.uint8),
+            "size": numpy.array([rgba.size[0], rgba.size[1]], dtype=numpy.int32),
+        }
+
+
+    @staticmethod
+    def _decode_cached_image(cache_data, prefix):
+        size = cache_data[f"{prefix}_size"].astype(numpy.int32)
+        width, height = int(size[0]), int(size[1])
+        if width == 0 or height == 0:
+            return None
+        pixels = cache_data[f"{prefix}_pixels"].astype(numpy.uint8).tobytes()
+        return Image.frombytes("RGBA", (width, height), pixels)
+
+
+    @staticmethod
+    def _factor_to_rgba(values):
+        rgba = list(values[:4]) + [1.0] * max(0, 4 - len(values))
+        return tuple(
+            int(max(0.0, min(1.0, float(component))) * 255.0)
+            for component in rgba[:4]
         )
 
 
@@ -506,6 +763,93 @@ class Mesh:
             normalized[index + 2] = float((normalized[index + 2] - min_z) * scale)
 
         return normalized
+
+
+    @staticmethod
+    def normalize_vertex_batches(vertex_batches, vertex_size=8, target_size=3.0):
+        if not vertex_batches:
+            return vertex_batches
+
+        all_positions = []
+        for vertices in vertex_batches:
+            if not vertices:
+                continue
+            all_positions.extend(
+                vertices[index:index + 3]
+                for index in range(0, len(vertices), vertex_size)
+            )
+
+        if not all_positions:
+            return [list(vertices) for vertices in vertex_batches]
+
+        positions = numpy.array(all_positions, dtype=numpy.float32)
+        min_corner = positions.min(axis=0)
+        max_corner = positions.max(axis=0)
+        center_xy = (min_corner[:2] + max_corner[:2]) / 2
+        min_z = min_corner[2]
+        size = max_corner - min_corner
+        max_dimension = max(float(size.max()), 1e-6)
+        scale = target_size / max_dimension
+
+        normalized_batches = []
+        for vertices in vertex_batches:
+            normalized = list(vertices)
+            for index in range(0, len(normalized), vertex_size):
+                normalized[index] = float((normalized[index] - center_xy[0]) * scale)
+                normalized[index + 1] = float((normalized[index + 1] - center_xy[1]) * scale)
+                normalized[index + 2] = float((normalized[index + 2] - min_z) * scale)
+            normalized_batches.append(normalized)
+
+        return normalized_batches
+
+
+    @staticmethod
+    def append_tangents(vertices, vertex_size=8):
+        if not vertices:
+            return vertices
+        if vertex_size == 11 and len(vertices) % 11 == 0:
+            return list(vertices)
+
+        expanded = []
+        triangle_stride = vertex_size * 3
+        for triangle_start in range(0, len(vertices), triangle_stride):
+            tri = vertices[triangle_start:triangle_start + triangle_stride]
+            if len(tri) < triangle_stride:
+                break
+
+            p0 = numpy.array(tri[0:3], dtype=numpy.float32)
+            uv0 = numpy.array(tri[3:5], dtype=numpy.float32)
+            n0 = numpy.array(tri[5:8], dtype=numpy.float32)
+
+            p1 = numpy.array(tri[vertex_size:vertex_size + 3], dtype=numpy.float32)
+            uv1 = numpy.array(tri[vertex_size + 3:vertex_size + 5], dtype=numpy.float32)
+
+            p2 = numpy.array(tri[vertex_size * 2:vertex_size * 2 + 3], dtype=numpy.float32)
+            uv2 = numpy.array(tri[vertex_size * 2 + 3:vertex_size * 2 + 5], dtype=numpy.float32)
+
+            edge1 = p1 - p0
+            edge2 = p2 - p0
+            delta_uv1 = uv1 - uv0
+            delta_uv2 = uv2 - uv0
+            denominator = (delta_uv1[0] * delta_uv2[1]) - (delta_uv2[0] * delta_uv1[1])
+
+            if abs(float(denominator)) < 1e-6:
+                tangent = numpy.cross(n0, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32))
+                if numpy.linalg.norm(tangent) < 1e-6:
+                    tangent = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
+            else:
+                inv = 1.0 / denominator
+                tangent = inv * ((delta_uv2[1] * edge1) - (delta_uv1[1] * edge2))
+
+            tangent_norm = max(float(numpy.linalg.norm(tangent)), 1e-6)
+            tangent = tangent / tangent_norm
+
+            for vertex_index in range(3):
+                offset = vertex_index * vertex_size
+                expanded.extend(tri[offset:offset + vertex_size])
+                expanded.extend((float(tangent[0]), float(tangent[1]), float(tangent[2])))
+
+        return expanded
 
 
     @staticmethod
@@ -614,6 +958,65 @@ class Mesh:
 
 
     @staticmethod
+    def _glb_node_matrix(node):
+        if "matrix" in node:
+            return numpy.array(node["matrix"], dtype=numpy.float32).reshape((4, 4))
+
+        translation = numpy.array(node.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32)
+        rotation = numpy.array(node.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32)
+        scale = numpy.array(node.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32)
+
+        translation_matrix = pyrr.matrix44.create_from_translation(translation, dtype=numpy.float32)
+        rotation_matrix = pyrr.matrix44.create_from_quaternion(rotation, dtype=numpy.float32)
+        scale_matrix = pyrr.matrix44.create_from_scale(scale, dtype=numpy.float32)
+        return numpy.matmul(numpy.matmul(translation_matrix, rotation_matrix), scale_matrix)
+
+
+    @staticmethod
+    def _build_glb_primitive_vertices(document, binary_chunk, primitive, world_matrix):
+        attributes = primitive.get("attributes", {})
+        positions = Mesh._read_glb_accessor(document, binary_chunk, attributes["POSITION"])
+        texcoords = None
+        normals = None
+        if "TEXCOORD_0" in attributes:
+            texcoords = Mesh._read_glb_accessor(document, binary_chunk, attributes["TEXCOORD_0"])
+        if "NORMAL" in attributes:
+            normals = Mesh._read_glb_accessor(document, binary_chunk, attributes["NORMAL"])
+
+        if "indices" in primitive:
+            indices = Mesh._read_glb_accessor(document, binary_chunk, primitive["indices"]).reshape(-1)
+        else:
+            indices = numpy.arange(len(positions), dtype=numpy.int32)
+
+        normal_matrix = numpy.linalg.inv(world_matrix[:3, :3]).T
+        vertices = []
+
+        for vertex_index in indices:
+            local_position = positions[int(vertex_index)]
+            position = world_matrix @ numpy.array(
+                [local_position[0], local_position[1], local_position[2], 1.0],
+                dtype=numpy.float32,
+            )
+            vertices.extend((float(position[0]), float(position[1]), float(position[2])))
+
+            if texcoords is not None:
+                uv = texcoords[int(vertex_index)]
+                vertices.extend((float(uv[0]), float(uv[1])))
+            else:
+                vertices.extend((0.0, 0.0))
+
+            if normals is not None:
+                local_normal = normals[int(vertex_index)]
+                normal = normal_matrix @ local_normal
+                normal /= max(float(numpy.linalg.norm(normal)), 1e-6)
+                vertices.extend((float(normal[0]), float(normal[1]), float(normal[2])))
+            else:
+                vertices.extend((0.0, 0.0, 1.0))
+
+        return vertices
+
+
+    @staticmethod
     def _read_glb_texture_image(document, binary_chunk, texture_index):
         if texture_index is None:
             return None
@@ -633,6 +1036,53 @@ class Mesh:
             return Image.open(image_path).convert("RGBA")
 
         return None
+
+
+    @staticmethod
+    def extract_glb_unique_positions(file_name):
+        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        nodes = document.get("nodes", [])
+        scene_index = document.get("scene", 0)
+        scenes = document.get("scenes", [])
+        if scenes and 0 <= scene_index < len(scenes):
+            root_nodes = scenes[scene_index].get("nodes", [])
+        else:
+            root_nodes = list(range(len(nodes)))
+
+        unique_positions = {}
+        identity = numpy.identity(4, dtype=numpy.float32)
+
+        def visit(node_index, parent_matrix):
+            node = nodes[node_index]
+            local_matrix = Mesh._glb_node_matrix(node)
+            world_matrix = numpy.matmul(parent_matrix, local_matrix)
+
+            if "mesh" in node:
+                mesh_def = document["meshes"][node["mesh"]]
+                for primitive in mesh_def.get("primitives", []):
+                    attributes = primitive.get("attributes", {})
+                    if "POSITION" not in attributes:
+                        continue
+                    positions = Mesh._read_glb_accessor(document, binary_chunk, attributes["POSITION"])
+                    for local_position in positions:
+                        position = world_matrix @ numpy.array(
+                            [local_position[0], local_position[1], local_position[2], 1.0],
+                            dtype=numpy.float32,
+                        )
+                        key = (
+                            round(float(position[0]), 6),
+                            round(float(position[1]), 6),
+                            round(float(position[2]), 6),
+                        )
+                        unique_positions[key] = key
+
+            for child_index in node.get("children", []):
+                visit(child_index, world_matrix)
+
+        for root_index in root_nodes:
+            visit(root_index, identity)
+
+        return list(unique_positions.values())
 
 
     @staticmethod
@@ -769,7 +1219,7 @@ class Mesh:
 
 
     def _compute_local_bounds(self):
-        positions = self.vertices.reshape(-1, 8)[:, :3]
+        positions = self.vertices.reshape(-1, self.vertex_size)[:, :3]
         minimum = positions.min(axis=0)
         maximum = positions.max(axis=0)
         return minimum, maximum

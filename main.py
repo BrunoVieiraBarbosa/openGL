@@ -3,7 +3,6 @@ import random
 
 import arcade
 import numpy
-from PIL import Image
 from OpenGL.GL import *
 
 from core.core import *
@@ -26,8 +25,8 @@ class GameWindow(App):
 
     def _setup_scene(self):
         self.terrain_origin = numpy.array([10.0, 4.0, -0.02], dtype=numpy.float32)
-        self.terrain_obj_path = os.path.join("obj", "terrain_main.obj")
-        self.terrain_sampler = TerrainGridSampler.from_obj(self.terrain_obj_path)
+        self.terrain_glb_path = os.path.join("obj", "terrain_main.glb")
+        self.terrain_sampler = TerrainGridSampler.from_glb(self.terrain_glb_path)
         self.terrain_height = lambda world_x, world_y: self.terrain_sampler.sample_height(
             world_x - self.terrain_origin[0],
             world_y - self.terrain_origin[1],
@@ -78,15 +77,10 @@ class GameWindow(App):
             scale=90.0,
         )
 
-        self.texture = Material(
-            os.path.join("textures", "teste.png"),
-            os.path.join("textures", "teste_specular.png"),
-            os.path.join("textures", "teste_specular.png"),
-        )
-        self.texture2 = Material(
+        self.crate_texture = Material(
             os.path.join("textures", "box.jpg"),
             os.path.join("textures", "box_specular.jpg"),
-            os.path.join("textures", "box_specular.jpg"),
+            Material._solid_image((128, 128, 255, 255)),
         )
         self.ground_texture = Material(
             os.path.join("textures", "block.png"),
@@ -94,46 +88,43 @@ class GameWindow(App):
             os.path.join("textures", "normal.jpg"),
         )
 
-        ground_vertices = Mesh.load_obj_prepared(
-            self.terrain_obj_path,
-            invert_texcoord=False,
-            st_pos=4,
-            vertex_size=8,
+        self.terrain_meshes, self.terrain_materials = self._build_glb_model(
+            self.terrain_glb_path,
+            self.terrain_origin,
             target_size=52.0,
             normalize=False,
         )
-        self.terrain = Mesh(self.shaders[0], self.ground_texture, self.terrain_origin, ground_vertices)
+        self.terrain = self._get_primary_mesh(self.terrain_meshes)
 
-        obj_scene = [
-            ("nem.obj", [-2, -1, 0], self.texture, 0.42, 0.08),
-            ("monkey.obj", [7, -3, 0], self.texture, 0.5, 0.12),
-            ("IronMan.obj", [27, 1, 0], self.texture, 0.38, 0.1),
-            ("break_time.obj", [12, 12, 0], self.texture, 0.44, 0.1),
-            ("cube.obj", [24, 10, 0], self.texture2, 0.7, 0.12),
+        glb_scene = [
+            ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
+            ("break_time.glb", [12, 12, 0], 1.8, 0.44, 0.1),
         ]
         self.scene_meshes = []
-        for file_name, position, material, collider_radius_scale, collider_radius_padding in obj_scene:
-            vertices = Mesh.load_obj_prepared(
-                os.path.join("obj", file_name),
-                invert_texcoord=True,
-                st_pos=4,
-                vertex_size=8,
-                target_size=1.8,
-            )
+        self.scene_materials = []
+        for file_name, position, target_size, collider_radius_scale, collider_radius_padding in glb_scene:
             grounded_position = [position[0], position[1], self.terrain_height(position[0], position[1])]
-            mesh = Mesh(self.shaders[0], material, grounded_position, vertices)
-            mesh.set_collider(
+            model_meshes, model_materials = self._build_glb_model(
+                os.path.join("obj", file_name),
+                grounded_position,
+                target_size=target_size,
+                normalize=True,
+            )
+            self.scene_materials.extend(model_materials)
+            primary_mesh = max(model_meshes, key=lambda mesh: mesh.vertex_count)
+            primary_mesh.extra_meshes = [mesh for mesh in model_meshes if mesh is not primary_mesh]
+            primary_mesh.set_collider(
                 mode="circle",
                 radius_scale=collider_radius_scale,
                 radius_padding=collider_radius_padding,
                 height_padding=0.1,
             )
-            self.scene_meshes.append(mesh)
+            self.scene_meshes.append(primary_mesh)
 
         self.cubes = [
             Mesh(
                 self.shaders[0],
-                self.texture2,
+                self.crate_texture,
                 [
                     random.randint(-6, 30),
                     random.randint(-8, 16),
@@ -148,22 +139,13 @@ class GameWindow(App):
             cube.set_collider(mode="circle", radius_scale=1.0, radius_padding=0.08, height_padding=0.08)
 
         player_start = numpy.array([10.0, -14.0, self.terrain_height(10, -14)], dtype=numpy.float32)
-        player_vertices = Mesh.load_glb_prepared(
+        self.player_meshes, self.player_materials = self._build_glb_model(
             os.path.join("obj", "Player.glb"),
-            invert_texcoord=False,
-            st_pos=4,
-            vertex_size=8,
+            player_start,
             target_size=1.9,
-            rotation_degrees=(0.0, 0.0, 0.0),
+            normalize=True,
         )
-        player_material_images = Mesh.load_glb_material_images(os.path.join("obj", "Player.glb"))
-        fallback_normal = Image.new("RGBA", (1, 1), (128, 128, 255, 255))
-        self.player_material = Material(
-            player_material_images.get("diffuse") or Image.new("RGBA", (1, 1), (255, 255, 255, 255)),
-            player_material_images.get("specular") or Image.new("RGBA", (1, 1), (255, 255, 255, 255)),
-            player_material_images.get("normal") or fallback_normal,
-        )
-        self.player_mesh = Mesh(self.shaders[0], self.player_material, player_start.copy(), player_vertices)
+        self.player_mesh = self._get_primary_mesh(self.player_meshes)
         self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
 
         self.camera = CameraThirdPerson(player_start, distance=5.6, height=1.55)
@@ -176,8 +158,9 @@ class GameWindow(App):
             [self.shaders[0], self.shaders[1]],
             self.player_mesh,
             player_start,
-            mesh_rotation_offset=(-90.0, 0.0, 0.0),
-            mesh_position_offset=(0.0, 0.0, 0.95),
+            visual_meshes=self.player_meshes,
+            mesh_rotation_offset=(0.0, 0.0, 0.0),
+            mesh_position_offset=(0.0, 0.0, 0.0),
             mesh_heading_offset=-90.0,
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
@@ -185,7 +168,37 @@ class GameWindow(App):
             terrain_contains_fn=self.terrain_contains,
         )
         self.player.update(0.0)
-        self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
+
+    def _build_glb_model(self, file_path, position, target_size, normalize=True, rotation_degrees=(0.0, 0.0, 0.0)):
+        submeshes = Mesh.load_glb_submeshes_prepared(
+            file_path,
+            invert_texcoord=False,
+            st_pos=4,
+            vertex_size=8,
+            target_size=target_size,
+            normalize=normalize,
+            rotation_degrees=rotation_degrees,
+        )
+        material_cache = {}
+        materials = []
+        meshes = []
+        for submesh in submeshes:
+            material_index = submesh["material_index"]
+            material = material_cache.get(material_index)
+            if material is None:
+                if material_index >= 0:
+                    material_images = Mesh.load_glb_material_images(file_path, material_index=material_index)
+                    material = Material.from_compatible_glb_images(material_images)
+                else:
+                    material = self.ground_texture
+                material_cache[material_index] = material
+                if material is not self.ground_texture:
+                    materials.append(material)
+            meshes.append(Mesh(self.shaders[0], material, numpy.array(position, dtype=numpy.float32).copy(), submesh["vertices"]))
+        return meshes, materials
+
+    def _get_primary_mesh(self, meshes):
+        return max(meshes, key=lambda mesh: mesh.vertex_count)
 
     def _cleanup(self):
         if self.cleaned_up:
@@ -194,13 +207,14 @@ class GameWindow(App):
         self.cleaned_up = True
         glDeleteProgram(self.shaders[0])
         glDeleteProgram(self.shaders[1])
-        self.texture.destroy()
-        self.texture2.destroy()
+        self.crate_texture.destroy()
         self.ground_texture.destroy()
-        self.player_material.destroy()
-        self.terrain.destroy()
-        self.player_mesh.destroy()
-        [x.destroy() for x in self.scene_meshes]
+        [material.destroy() for material in self.terrain_materials]
+        [material.destroy() for material in self.player_materials]
+        [material.destroy() for material in self.scene_materials]
+        [mesh.destroy() for mesh in self.terrain_meshes]
+        [mesh.destroy() for mesh in self.player_meshes]
+        [mesh.destroy() for primary in self.scene_meshes for mesh in [primary, *getattr(primary, "extra_meshes", [])]]
         [x.destroy() for x in self.cubes]
         [x.destroy() for x in self.lampada]
         self.sky.destroy()
@@ -211,10 +225,14 @@ class GameWindow(App):
         glDepthMask(GL_FALSE)
         self.sky.draw()
         glDepthMask(GL_TRUE)
-        self.terrain.draw()
-        self.player_mesh.draw()
+        [mesh.draw() for mesh in self.terrain_meshes]
+        [mesh.draw() for mesh in self.player_meshes]
         [x.draw() for x in self.cubes]
-        [x.draw() for x in self.scene_meshes]
+        [
+            mesh.draw()
+            for primary in self.scene_meshes
+            for mesh in [primary, *getattr(primary, "extra_meshes", [])]
+        ]
         [x.draw() for x in self.lampada]
 
     def on_update(self, delta_time):
