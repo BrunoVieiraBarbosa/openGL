@@ -1,41 +1,41 @@
+import arcade
+
 from core.core import CameraFirstPerson
-from OpenGL.GL import *
-import pygame
 
 
 class PlayerFirstPerson:
-    def __init__(self, screen_size, camera: CameraFirstPerson, shaders) -> None:
-        self.screen_size = screen_size
+    def __init__(self, camera: CameraFirstPerson, shaders) -> None:
         self.camera = camera
         self.shaders = shaders
         self.speed = 15
+        self.look_sensitivity = 0.15
+        self.keys_down = set()
 
+    def on_key_press(self, symbol):
+        self.keys_down.add(symbol)
+
+    def on_key_release(self, symbol):
+        self.keys_down.discard(symbol)
+
+    def on_mouse_motion(self, dx, dy):
+        horizontal = -dx * self.look_sensitivity
+        vertical = dy * self.look_sensitivity
+        self.rotate(horizontal, vertical)
 
     def update(self, delta_time):
-        key_ = pygame.key.get_pressed()
-        mouse = pygame.mouse.get_pos()
-
-        if key_[pygame.K_w]:
+        if arcade.key.W in self.keys_down:
             self.move(0, self.speed * delta_time)
-        if key_[pygame.K_a]:
+        if arcade.key.A in self.keys_down:
             self.move(90, self.speed * delta_time)
-        if key_[pygame.K_s]:
+        if arcade.key.S in self.keys_down:
             self.move(180, self.speed * delta_time)
-        if key_[pygame.K_d]:
+        if arcade.key.D in self.keys_down:
             self.move(-90, self.speed * delta_time)
-
-        # print(fps)
-        horizontal = self.speed * delta_time * (self.screen_size[0]/2 - mouse[0])
-        vertical = self.speed * delta_time * (self.screen_size[1]/2 - mouse[1])
-        self.rotate(horizontal, vertical)
-        pygame.mouse.set_pos((self.screen_size[0]//2, self.screen_size[1]//2))
 
         self.camera.update(self.shaders)
 
-
     def move(self, direction, amount):
         self.camera.move(direction, amount)
-
 
     def rotate(self, horizontal, vertical):
         self.camera.increment_direction(horizontal, vertical)

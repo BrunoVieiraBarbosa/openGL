@@ -1,117 +1,152 @@
-from core.mesh import Mesh, MeshRGB
-from core.light import DirectionalLight, FlashLight, Light, PointLight
-from core.core import *
-from core.utils import *
-from OpenGL.GL import *
-import pygame, os, random
+import os
+import random
 
-def quit_engine(shader, shader_basic, texture, texture2, monkey, cubes):
-    pygame.quit()
-    glDeleteProgram(shader)
-    glDeleteProgram(shader_basic)
-    texture.destroy()
-    texture2.destroy()
-    [x.destroy() for x in monkey]
-    [x.destroy() for x in cubes]
-    exit(0)
+import arcade
+from OpenGL.GL import *
+
+from core.core import *
+from core.light import FlashLight, PointLight
+from core.mesh import Mesh, MeshRGB
+from core.utils import *
+
+
+class GameWindow(App):
+    def __init__(self):
+        size = (1280, 720)
+        super().__init__(size)
+        self.set_mouse_visible(False)
+        self.set_exclusive_mouse(True)
+        self.cleaned_up = False
+        self._setup_scene()
+
+    def _setup_scene(self):
+        self.add_shader("first", Shader.create_shader("shaders/vertex.c", "shaders/fragment.c"))
+        self.add_shader("simple", Shader.create_shader("shaders/vertex_rgb.c", "shaders/fragment_rgb.c"))
+
+        self.start_()
+
+        self.light = [
+            PointLight([self.shaders[0], self.shaders[1]], [15, 14, 15], [1, 1, 1], 8, 0, [True, False]),
+            FlashLight(
+                [self.shaders[0], self.shaders[1]],
+                [15, 0, 15],
+                [-0.2, -1.0, -0.3],
+                [0.8, 0.8, 0.8],
+                8,
+                1,
+                15,
+                20,
+                [True, False],
+            ),
+            FlashLight(
+                [self.shaders[0], self.shaders[1]],
+                [15, 7, 15],
+                [1, 0.2, 0.1],
+                [0.8, 0.8, 0.8],
+                10,
+                1,
+                15,
+                20,
+                [True, False],
+            ),
+        ]
+
+        self.lampada = [
+            MeshRGB(self.shaders[1], self.light[0], color=[1, 1, 1]),
+            MeshRGB(self.shaders[1], self.light[1], color=[0, 1, 0]),
+            MeshRGB(self.shaders[1], self.light[2], color=[0, 1, 1]),
+        ]
+
+        self.texture = Material(
+            os.path.join("textures", "teste.png"),
+            os.path.join("textures", "teste_specular.png"),
+            os.path.join("textures", "teste_specular.png"),
+        )
+        self.texture2 = Material(
+            os.path.join("textures", "box.jpg"),
+            os.path.join("textures", "box_specular.jpg"),
+            os.path.join("textures", "box_specular.jpg"),
+        )
+
+        vertices = Mesh.load_obj("obj/nem.obj")
+        vertices = Mesh.invert_s_or_t(vertices, 4, 8)
+        self.monkey = [Mesh(self.shaders[0], self.texture, [2, 7, 1], vertices)]
+
+        self.cubes = [
+            Mesh(
+                self.shaders[0],
+                self.texture2,
+                [random.randint(x, x * 2), random.randint(y, y * 2), 0],
+            )
+            for y in range(10)
+            for x in range(10)
+        ]
+        self.camera = CameraFirstPerson([-10, 7, 2])
+        self.player = PlayerFirstPerson(self.camera, [self.shaders[0], self.shaders[1]])
+        self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
+
+    def _cleanup(self):
+        if self.cleaned_up:
+            return
+
+        self.cleaned_up = True
+        glDeleteProgram(self.shaders[0])
+        glDeleteProgram(self.shaders[1])
+        self.texture.destroy()
+        self.texture2.destroy()
+        [x.destroy() for x in self.monkey]
+        [x.destroy() for x in self.cubes]
+        [x.destroy() for x in self.lampada]
+
+    def on_draw(self):
+        self.clear()
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        [x.draw() for x in self.cubes]
+        [x.draw() for x in self.monkey]
+        [x.draw() for x in self.lampada]
+
+    def on_update(self, delta_time):
+        self.light[0].position[0] -= 0.02
+        self.light[0].position[1] -= 0.02
+        self.light[0].position[2] -= 0.02
+
+        self.light[1].position[0] -= 0.02
+        self.light[1].position[1] += 0.02
+        self.light[1].position[2] -= 0.02
+
+        self.light[2].position[0] -= 0.02
+        self.light[2].position[2] -= 0.02
+
+        [x.update() for x in self.light]
+        [x.rotate_xyz(0.5) for x in self.monkey]
+        [x.rotate_xyz(self.cubes_rotate[i]) for i, x in enumerate(self.cubes)]
+        self.player.update(delta_time)
+
+        fps = 0 if delta_time <= 0 else round(1 / delta_time, 0)
+        self.set_caption(str(fps))
+
+    def on_key_press(self, symbol: int, modifiers: int):
+        if symbol == arcade.key.ESCAPE:
+            self.close()
+            return
+
+        self.player.on_key_press(symbol)
+
+    def on_key_release(self, symbol: int, modifiers: int):
+        self.player.on_key_release(symbol)
+
+    def on_mouse_motion(self, x: float, y: float, dx: float, dy: float):
+        self.player.on_mouse_motion(dx, dy)
+
+    def on_close(self):
+        self._cleanup()
+        super().on_close()
 
 
 def main():
-    size = (1280, 720)
-    engine = App(size)
-    pygame.mouse.set_visible(False)
-    pygame.mouse.set_pos((size[0]//2, size[1]//2))
-
-    engine.add_shader('first', Shader.create_shader('shaders/vertex.c', 'shaders/fragment.c'))
-    engine.add_shader('simple', Shader.create_shader('shaders/vertex_rgb.c', 'shaders/fragment_rgb.c'))
-
-    engine.start_()
-    #[-0.2, -1.0, -0.3]
-    #Objetos da cena
-    #light = [Light([engine.shaders[0], engine.shaders[1]], [1.0, 1.0, 1.0], [2, 5, 2], 16, 0, [True, False])]
-    #light = [DirectionalLight([engine.shaders[0], engine.shaders[1]], [-0.2, -1.0, -0.3], [1, 1, 1], 16, 0,[True, False])]
-    #light = [FlashLight([engine.shaders[0], engine.shaders[1]], [5, 5, 2], [-0.2, -1.0, -0.3], [.8, .8, .8], 16,
-    #                                                        0, 15, 20, [True, False])]
-    light = [PointLight([engine.shaders[0], engine.shaders[1]], [15, 14, 15], [1, 1, 1], 8, 0, [True, False]),
-            FlashLight([engine.shaders[0], engine.shaders[1]], [15, 0, 15], [-0.2, -1.0, -0.3], [.8, .8, .8], 8,
-                                                                                1, 15, 20, [True, False]),
-            FlashLight([engine.shaders[0], engine.shaders[1]], [15, 7, 15], [1, .2, .1], [.8, .8, .8], 10,
-                                                                                1, 15, 20, [True, False])
-                                                                                ]
-
-    lampada = [MeshRGB(engine.shaders[1], light[0], color=[1, 1, 1]),
-                MeshRGB(engine.shaders[1], light[1], color=[0, 1, 0]),
-                MeshRGB(engine.shaders[1], light[2], color=[0, 1, 1])]
-    
-    red = pygame.Surface((10, 10))
-    red.fill((255, 0, 0))
-
-    texture = Material(os.path.join('textures', 'teste.png'), os.path.join('textures', 'teste_specular.png'),
-                                            os.path.join('textures', 'teste_specular.png'))
-    texture2 = Material(os.path.join('textures', 'box.jpg'), os.path.join('textures', 'box_specular.jpg'), 
-                                            os.path.join('textures', 'box_specular.jpg'))
-
-    black = pygame.Surface((10, 10))
-    black.fill((0, 0, 0))
+    GameWindow()
+    arcade.run()
 
 
-    vertices = Mesh.load_obj('obj/nem.obj')
-    vertices = Mesh.invert_s_or_t(vertices, 4, 8)
-    monkey = [Mesh(engine.shaders[0], texture, [2, 7, 1], vertices)]
-    #vertices = Mesh.load_obj('monkey.obj')
-    #monkey.append(Mesh(shader, texture3, [8, 8, 1], vertices))
-    
-
-    cubes = [Mesh(engine.shaders[0], texture2, [random.randint(x, x*2), random.randint(y, y*2), 0]) for y in range(10) for x in range(10)]
-    camera = CameraFirstPerson([-10, 7, 2])
-    player = PlayerFirstPerson(size, camera, [engine.shaders[0], engine.shaders[1]])
-
-    cubes_rotate = [random.randint(-5, 5)/10 for _ in cubes]
-
-
-    clock = pygame.time.Clock()
-
-    while True:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                quit_engine(engine.shaders[0], engine.shaders[1], texture, texture2, monkey, cubes)
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    quit_engine(engine.shaders[0], engine.shaders[1], texture, texture2, monkey, cubes)
-                    
-        #Move camera
-        light[0].position[0] -= .02
-        light[0].position[1] -= .02
-        light[0].position[2] -= .02
-
-        light[1].position[0] -= .02
-        light[1].position[1] += .02
-        light[1].position[2] -= .02
-
-        light[2].position[0] -= .02
-        light[2].position[2] -= .02
-
-        #Update
-        [x.update() for x in light]
-        [x.rotate_xyz(.5) for x in monkey]
-        [x.rotate_xyz(cubes_rotate[i]) for i, x in enumerate(cubes)]
-        player.update(1 / max(clock.get_fps(), 1))
-
-
-
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        [x.draw() for x in cubes]
-        [x.draw() for x in monkey]
-        [x.draw() for x in lampada]
-
-        pygame.display.flip()
-
-        clock.tick(60)
-
-        pygame.display.set_caption(str(round(clock.get_fps(), 0)))
-        
-
-
-
-if (__name__ == '__main__'):
+if __name__ == "__main__":
     main()
