@@ -155,6 +155,7 @@ class PlayerThirdPerson(PlayerController):
         self.character_height = 1.3
         self.look_sensitivity = 0.18
         self.facing_yaw = self.camera.theta
+        self.last_world_direction = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
         self.camera.update_focus(self.position)
         self._sync_visuals()
 
@@ -187,17 +188,20 @@ class PlayerThirdPerson(PlayerController):
         movement = numpy.array([input_x, input_y], dtype=numpy.float32)
         movement /= max(float(numpy.linalg.norm(movement)), 1e-6)
 
+        # Character facing is derived directly from camera heading plus input direction.
+        # This keeps W aligned with the current camera forward.
         input_angle = numpy.degrees(numpy.arctan2(-movement[0], movement[1]))
         self.facing_yaw = float((self.camera.theta + input_angle) % 360.0)
-        facing_radians = numpy.radians(self.facing_yaw)
-        return numpy.array(
-            [
-                numpy.cos(facing_radians, dtype=numpy.float32),
-                numpy.sin(facing_radians, dtype=numpy.float32),
-                0.0,
-            ],
+
+        camera_theta = numpy.radians(self.camera.theta)
+        camera_forward = numpy.array(
+            [numpy.cos(camera_theta, dtype=numpy.float32), numpy.sin(camera_theta, dtype=numpy.float32)],
             dtype=numpy.float32,
         )
+        camera_right = numpy.array([camera_forward[1], -camera_forward[0]], dtype=numpy.float32)
+        world_direction = camera_forward * movement[1] + camera_right * movement[0]
+        world_direction /= max(float(numpy.linalg.norm(world_direction)), 1e-6)
+        return numpy.array([world_direction[0], world_direction[1], 0.0], dtype=numpy.float32)
 
     def _move(self, movement):
         current_position = self.position.copy()
@@ -224,5 +228,5 @@ class PlayerThirdPerson(PlayerController):
         self.player_mesh.set_rotation(
             x=rotation_x,
             y=rotation_y,
-            z=rotation_z + self.facing_yaw + self.mesh_heading_offset,
+            z=rotation_z - self.facing_yaw + self.mesh_heading_offset,
         )

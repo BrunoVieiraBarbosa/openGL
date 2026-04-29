@@ -153,7 +153,7 @@ class GameWindow(App):
             st_pos=4,
             vertex_size=8,
             target_size=1.9,
-            rotation_degrees=(-90.0, 0.0, 0.0),
+            rotation_degrees=(90.0, 0.0, 0.0),
         )
         self.player_mesh = Mesh(self.shaders[0], self.texture, player_start.copy(), player_vertices)
         self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
@@ -168,9 +168,9 @@ class GameWindow(App):
             [self.shaders[0], self.shaders[1]],
             self.player_mesh,
             player_start,
-            mesh_rotation_offset=(0.0, 0.0, 0.0),
-            mesh_position_offset=(0.0, 0.0, 0.0),
-            mesh_heading_offset=0.0,
+            mesh_rotation_offset=(180.0, 0.0, 0.0),
+            mesh_position_offset=(0.0, 0.0, 1.9),
+            mesh_heading_offset=-90.0,
             colliders=static_colliders,
             terrain_bounds=self.terrain.get_world_bounds(),
             ground_height_fn=self.terrain_height,
