@@ -5,7 +5,7 @@ import arcade
 from OpenGL.GL import *
 
 from core.core import *
-from core.light import FlashLight, PointLight
+from core.light import DirectionalLight, PointLight
 from core.mesh import Mesh, MeshRGB
 from core.utils import *
 
@@ -13,7 +13,7 @@ from core.utils import *
 class GameWindow(App):
     def __init__(self):
         size = (1280, 720)
-        super().__init__(size)
+        super().__init__(size, ambient_color=(0.35, 0.35, 0.38, 1.0))
         self.set_mouse_visible(False)
         self.set_exclusive_mouse(True)
         self.cleaned_up = False
@@ -26,35 +26,28 @@ class GameWindow(App):
         self.start_()
 
         self.light = [
-            PointLight([self.shaders[0], self.shaders[1]], [15, 14, 15], [1, 1, 1], 8, 0, [True, False]),
-            FlashLight(
+            DirectionalLight(
                 [self.shaders[0], self.shaders[1]],
-                [15, 0, 15],
-                [-0.2, -1.0, -0.3],
-                [0.8, 0.8, 0.8],
-                8,
-                1,
-                15,
-                20,
+                [-0.4, -0.8, -1.0],
+                [1.0, 0.97, 0.92],
+                24,
+                0,
                 [True, False],
             ),
-            FlashLight(
+            PointLight([self.shaders[0], self.shaders[1]], [6, -2, 8], [1.0, 0.96, 0.9], 32, 1, [True, False]),
+            PointLight(
                 [self.shaders[0], self.shaders[1]],
-                [15, 7, 15],
-                [1, 0.2, 0.1],
-                [0.8, 0.8, 0.8],
-                10,
-                1,
-                15,
-                20,
+                [20, 6, 10],
+                [0.85, 0.9, 1.0],
+                32,
+                2,
                 [True, False],
             ),
         ]
 
         self.lampada = [
-            MeshRGB(self.shaders[1], self.light[0], color=[1, 1, 1]),
-            MeshRGB(self.shaders[1], self.light[1], color=[0, 1, 0]),
-            MeshRGB(self.shaders[1], self.light[2], color=[0, 1, 1]),
+            MeshRGB(self.shaders[1], self.light[1], color=[1, 0.95, 0.8]),
+            MeshRGB(self.shaders[1], self.light[2], color=[0.7, 0.85, 1.0]),
         ]
 
         self.texture = Material(
@@ -67,22 +60,53 @@ class GameWindow(App):
             os.path.join("textures", "box_specular.jpg"),
             os.path.join("textures", "box_specular.jpg"),
         )
+        self.ground_texture = Material(
+            os.path.join("textures", "wood_leve.jpg"),
+            os.path.join("textures", "wood_leve.jpg"),
+            os.path.join("textures", "normal.jpg"),
+        )
 
-        vertices = Mesh.load_obj("obj/nem.obj")
-        vertices = Mesh.invert_s_or_t(vertices, 4, 8)
-        self.monkey = [Mesh(self.shaders[0], self.texture, [2, 7, 1], vertices)]
+        ground_vertices = Mesh.create_plane(width=52.0, depth=38.0, uv_scale=12.0)
+        self.terrain = Mesh(self.shaders[0], self.ground_texture, [10, 4, -0.02], ground_vertices)
+
+        obj_scene = [
+            ("nem.obj", [-2, -1, 0], self.texture),
+            ("monkey.obj", [7, -3, 0], self.texture),
+            ("IronMan.obj", [27, 1, 0], self.texture),
+            ("untitled.obj", [1, 10, 0], self.texture),
+            ("break_time.obj", [12, 12, 0], self.texture),
+            ("cube.obj", [24, 10, 0], self.texture2),
+        ]
+        self.scene_meshes = []
+        for file_name, position, material in obj_scene:
+            vertices = Mesh.load_obj_prepared(
+                os.path.join("obj", file_name),
+                invert_texcoord=True,
+                st_pos=4,
+                vertex_size=8,
+                target_size=1.8,
+            )
+            self.scene_meshes.append(Mesh(self.shaders[0], material, position, vertices))
 
         self.cubes = [
             Mesh(
                 self.shaders[0],
                 self.texture2,
-                [random.randint(x, x * 2), random.randint(y, y * 2), 0],
+                [random.randint(-6, 30), random.randint(-8, 16), 0.18],
+                scale=0.22,
             )
-            for y in range(10)
-            for x in range(10)
+            for _ in range(14)
         ]
-        self.camera = CameraFirstPerson([-10, 7, 2])
-        self.player = PlayerFirstPerson(self.camera, [self.shaders[0], self.shaders[1]])
+        self.camera = CameraFirstPerson([10, -14, 1.7])
+        self.camera.theta = 72
+        self.camera.phi = -8
+        static_colliders = self.scene_meshes + self.cubes
+        self.player = PlayerFirstPerson(
+            self.camera,
+            [self.shaders[0], self.shaders[1]],
+            colliders=static_colliders,
+            terrain_bounds=self.terrain.get_world_bounds(),
+        )
         self.cubes_rotate = [random.randint(-5, 5) / 10 for _ in self.cubes]
 
     def _cleanup(self):
@@ -94,32 +118,22 @@ class GameWindow(App):
         glDeleteProgram(self.shaders[1])
         self.texture.destroy()
         self.texture2.destroy()
-        [x.destroy() for x in self.monkey]
+        self.ground_texture.destroy()
+        self.terrain.destroy()
+        [x.destroy() for x in self.scene_meshes]
         [x.destroy() for x in self.cubes]
         [x.destroy() for x in self.lampada]
 
     def on_draw(self):
         self.clear()
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self.terrain.draw()
         [x.draw() for x in self.cubes]
-        [x.draw() for x in self.monkey]
+        [x.draw() for x in self.scene_meshes]
         [x.draw() for x in self.lampada]
 
     def on_update(self, delta_time):
-        self.light[0].position[0] -= 0.02
-        self.light[0].position[1] -= 0.02
-        self.light[0].position[2] -= 0.02
-
-        self.light[1].position[0] -= 0.02
-        self.light[1].position[1] += 0.02
-        self.light[1].position[2] -= 0.02
-
-        self.light[2].position[0] -= 0.02
-        self.light[2].position[2] -= 0.02
-
         [x.update() for x in self.light]
-        [x.rotate_xyz(0.5) for x in self.monkey]
-        [x.rotate_xyz(self.cubes_rotate[i]) for i, x in enumerate(self.cubes)]
         self.player.update(delta_time)
 
         fps = 0 if delta_time <= 0 else round(1 / delta_time, 0)
