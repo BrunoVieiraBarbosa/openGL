@@ -228,38 +228,50 @@ class App(arcade.Window):
             numpy.float32,
         )
 
-        glUseProgram(self.shaders[0])
-        glUniformMatrix4fv(
-            glGetUniformLocation(self.shaders[0], "projection"),
-            1,
-            GL_FALSE,
-            projection_transform,
-        )
-
-        glUseProgram(self.shaders[1])
-        glUniformMatrix4fv(
-            glGetUniformLocation(self.shaders[1], "projection"),
-            1,
-            GL_FALSE,
-            projection_transform,
-        )
+        for shader in self.shaders:
+            glUseProgram(shader)
+            location = glGetUniformLocation(shader, "projection")
+            if location >= 0:
+                glUniformMatrix4fv(location, 1, GL_FALSE, projection_transform)
 
     def start_(self):
-        glUseProgram(self.shaders[0])
-        glUniform3fv(
-            glGetUniformLocation(self.shaders[0], "ambient"),
-            1,
-            numpy.array(self.ambient_color[:3], dtype=numpy.float32),
-        )
-        glUniform3fv(glGetUniformLocation(self.shaders[0], "fogColor"), 1, self.fog_color)
-        glUniform1f(glGetUniformLocation(self.shaders[0], "fogNear"), self.fog_near)
-        glUniform1f(glGetUniformLocation(self.shaders[0], "fogFar"), self.fog_far)
-        glUniform1i(glGetUniformLocation(self.shaders[0], "material.diffuse"), 0)
-        glUniform1i(glGetUniformLocation(self.shaders[0], "material.specular"), 1)
-        glUniform1i(glGetUniformLocation(self.shaders[0], "material.normal"), 2)
+        for shader in self.shaders:
+            glUseProgram(shader)
+
+            ambient_location = glGetUniformLocation(shader, "ambient")
+            if ambient_location >= 0:
+                glUniform3fv(
+                    ambient_location,
+                    1,
+                    numpy.array(self.ambient_color[:3], dtype=numpy.float32),
+                )
+
+            fog_color_location = glGetUniformLocation(shader, "fogColor")
+            if fog_color_location >= 0:
+                glUniform3fv(fog_color_location, 1, self.fog_color)
+
+            fog_near_location = glGetUniformLocation(shader, "fogNear")
+            if fog_near_location >= 0:
+                glUniform1f(fog_near_location, self.fog_near)
+
+            fog_far_location = glGetUniformLocation(shader, "fogFar")
+            if fog_far_location >= 0:
+                glUniform1f(fog_far_location, self.fog_far)
+
+            diffuse_location = glGetUniformLocation(shader, "material.diffuse")
+            if diffuse_location >= 0:
+                glUniform1i(diffuse_location, 0)
+
+            specular_location = glGetUniformLocation(shader, "material.specular")
+            if specular_location >= 0:
+                glUniform1i(specular_location, 1)
+
+            normal_location = glGetUniformLocation(shader, "material.normal")
+            if normal_location >= 0:
+                glUniform1i(normal_location, 2)
 
         self._apply_projection()
-        Light.reset_lights([self.shaders[0]])
+        Light.reset_lights(self.shaders)
 
     def on_resize(self, width: int, height: int):
         super().on_resize(width, height)

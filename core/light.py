@@ -20,7 +20,7 @@ class Light:
         for shader in shaders:
             glUseProgram(shader)
             for i in range(8):
-                glUniform1i(glGetUniformLocation(shader,f"lights[{i}].enabled"),0)
+                glUniform1i(glGetUniformLocation(shader,f"lights[{i}].enable"),0)
 
 
     def update(self):

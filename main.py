@@ -7,8 +7,18 @@ from OpenGL.GL import *
 
 from core.core import *
 from core.light import DirectionalLight, PointLight
-from core.mesh import Mesh, MeshRGB, TerrainGridSampler
+from core.mesh import Mesh, MeshRGB, SkinnedAnimator, SkinnedMesh, SkinnedModel, TerrainGridSampler
 from core.utils import *
+
+# Diagnostic options for isolating scale vs skinning issues in Player.glb:
+# - "static": same pipeline as the scene assets
+# - "skinned_bind_pose": skinned mesh frozen in bind/rest pose
+# - "skinned_walk": skinned mesh with animation updates enabled
+PLAYER_RENDER_MODE = "skinned_walk"
+PLAYER_TARGET_SIZE = 1.9
+PLAYER_NORMALIZE = True
+PLAYER_ALLOW_STATIC_FALLBACK = False
+PLAYER_ALWAYS_PLAY_WALK = False
 
 
 class GameWindow(App):
@@ -21,6 +31,7 @@ class GameWindow(App):
         self.set_mouse_visible(False)
         self.set_exclusive_mouse(True)
         self.cleaned_up = False
+        self.player_fallback_submeshes = []
         self._setup_scene()
 
     def _setup_scene(self):
@@ -39,26 +50,27 @@ class GameWindow(App):
 
         self.add_shader("first", Shader.create_shader("shaders/vertex.c", "shaders/fragment.c"))
         self.add_shader("simple", Shader.create_shader("shaders/vertex_rgb.c", "shaders/fragment_rgb.c"))
+        self.add_shader("skinned", Shader.create_shader("shaders/vertex_skinned.c", "shaders/fragment.c"))
 
         self.start_()
 
         self.light = [
             DirectionalLight(
-                [self.shaders[0], self.shaders[1]],
+                [self.shaders[0], self.shaders[1], self.shaders[2]],
                 [-0.4, -0.8, -1.0],
                 [1.0, 0.95, 0.86],
                 30,
                 0,
-                [True, False],
+                [True, False, True],
             ),
-            PointLight([self.shaders[0], self.shaders[1]], [6, -2, 8], [1.0, 0.96, 0.9], 32, 1, [True, False]),
+            PointLight([self.shaders[0], self.shaders[1], self.shaders[2]], [6, -2, 8], [1.0, 0.96, 0.9], 32, 1, [True, False, True]),
             PointLight(
-                [self.shaders[0], self.shaders[1]],
+                [self.shaders[0], self.shaders[1], self.shaders[2]],
                 [20, 6, 10],
                 [0.85, 0.9, 1.0],
                 32,
                 2,
-                [True, False],
+                [True, False, True],
             ),
         ]
 
@@ -139,11 +151,9 @@ class GameWindow(App):
             cube.set_collider(mode="circle", radius_scale=1.0, radius_padding=0.08, height_padding=0.08)
 
         player_start = numpy.array([10.0, -14.0, self.terrain_height(10, -14)], dtype=numpy.float32)
-        self.player_meshes, self.player_materials = self._build_glb_model(
+        self.player_meshes, self.player_materials, player_visual = self._build_player_visual(
             os.path.join("obj", "Player.glb"),
             player_start,
-            target_size=1.9,
-            normalize=True,
         )
         self.player_mesh = self._get_primary_mesh(self.player_meshes)
         self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
@@ -155,10 +165,11 @@ class GameWindow(App):
         static_colliders = self.scene_meshes + self.cubes
         self.player = PlayerThirdPerson(
             self.camera,
-            [self.shaders[0], self.shaders[1]],
+            self.shaders,
             self.player_mesh,
             player_start,
             visual_meshes=self.player_meshes,
+            animated_visual=player_visual,
             mesh_rotation_offset=(0.0, 0.0, 0.0),
             mesh_position_offset=(0.0, 0.0, 0.0),
             mesh_heading_offset=-90.0,
@@ -166,8 +177,9 @@ class GameWindow(App):
             terrain_bounds=self.terrain.get_world_bounds(),
             ground_height_fn=self.terrain_height,
             terrain_contains_fn=self.terrain_contains,
+            always_play_walk=PLAYER_ALWAYS_PLAY_WALK,
         )
-        self.player.update(0.0)
+        self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
 
     def _build_glb_model(self, file_path, position, target_size, normalize=True, rotation_degrees=(0.0, 0.0, 0.0)):
         submeshes = Mesh.load_glb_submeshes_prepared(
@@ -200,13 +212,192 @@ class GameWindow(App):
     def _get_primary_mesh(self, meshes):
         return max(meshes, key=lambda mesh: mesh.vertex_count)
 
+    def _build_player_visual(self, file_path, position):
+        if PLAYER_RENDER_MODE == "static":
+            meshes, materials = self._build_glb_model(
+                file_path,
+                position,
+                target_size=PLAYER_TARGET_SIZE,
+                normalize=PLAYER_NORMALIZE,
+            )
+            return meshes, materials, None
+
+        if PLAYER_RENDER_MODE == "skinned_bind_pose":
+            visual = self._build_skinned_glb_model(
+                file_path,
+                position,
+                target_size=PLAYER_TARGET_SIZE,
+                normalize=PLAYER_NORMALIZE,
+            )
+            return visual.meshes, visual.materials, None
+
+        if PLAYER_RENDER_MODE == "skinned_walk":
+            visual = self._build_skinned_glb_model(
+                file_path,
+                position,
+                target_size=PLAYER_TARGET_SIZE,
+                normalize=PLAYER_NORMALIZE,
+            )
+            return visual.meshes, visual.materials, visual
+
+        raise ValueError(f"Unsupported PLAYER_RENDER_MODE: {PLAYER_RENDER_MODE}")
+
+    def _build_skinned_glb_model(self, file_path, position, target_size, normalize):
+        self.player_fallback_submeshes = []
+        model_data = Mesh.load_glb_skinned_data(
+            file_path,
+            invert_texcoord=False,
+            target_size=target_size,
+            normalize=normalize,
+        )
+        static_submeshes = {
+            submesh["name"]: submesh
+            for submesh in Mesh.load_glb_submeshes_prepared(
+                file_path,
+                invert_texcoord=False,
+                st_pos=4,
+                vertex_size=8,
+                target_size=target_size,
+                normalize=normalize,
+            )
+        }
+        animator = SkinnedAnimator(
+            model_data["node_transforms"],
+            model_data["node_parents"],
+            model_data["animations"],
+            model_data["skins"],
+        )
+
+        material_cache = {}
+        materials = []
+        meshes = []
+        model_transform = model_data["transform"]
+        for submesh in model_data["submeshes"]:
+            material_index = submesh["material_index"]
+            material = material_cache.get(material_index)
+            if material is None:
+                if material_index >= 0:
+                    material_images = Mesh.load_glb_material_images(file_path, material_index=material_index)
+                    material = Material.from_compatible_glb_images(material_images)
+                else:
+                    material = self.ground_texture
+                material_cache[material_index] = material
+                if material is not self.ground_texture:
+                    materials.append(material)
+
+            static_submesh = static_submeshes.get(submesh["name"])
+            correction_matrix, correction_diff = self._compute_skinned_correction_matrix(
+                submesh,
+                animator,
+                static_submesh["vertices"] if static_submesh else None,
+                "standard",
+            )
+
+            mesh = SkinnedMesh(
+                self.shaders[2],
+                material,
+                numpy.array(position, dtype=numpy.float32).copy(),
+                submesh["vertices"],
+                animator,
+                submesh["skin_index"],
+                submesh["mesh_bind_matrix"],
+                skinning_mode="standard",
+                post_skinning_transform=correction_matrix,
+                origin_offset=numpy.zeros(3, dtype=numpy.float32),
+                scale=1.0,
+            )
+            needs_fallback = (
+                static_submesh is not None
+                and self._skinned_mesh_needs_static_fallback(mesh, static_submesh["vertices"])
+            )
+            if needs_fallback:
+                self.player_fallback_submeshes.append(
+                    f"{submesh['name']} (bind diff corrigido {correction_diff:.4f})"
+                )
+                if PLAYER_ALLOW_STATIC_FALLBACK:
+                    mesh.destroy()
+                    mesh = Mesh(
+                        self.shaders[0],
+                        material,
+                        numpy.array(position, dtype=numpy.float32).copy(),
+                        static_submesh["vertices"],
+                    )
+            meshes.append(mesh)
+
+        if self.player_fallback_submeshes:
+            if PLAYER_ALLOW_STATIC_FALLBACK:
+                print("Player fallback estatico por submalha:")
+            else:
+                print("Player submalhas com bind divergente, mantendo skinning para animacao:")
+            for submesh_name in self.player_fallback_submeshes:
+                print(f" - {submesh_name}")
+        else:
+            print("Player skinned sem fallback de submalha.")
+
+        return SkinnedModel(meshes, materials, animator)
+
+    def _skinned_mesh_needs_static_fallback(self, skinned_mesh, static_vertices, max_allowed_diff=0.45):
+        static_positions = numpy.array(static_vertices, dtype=numpy.float32).reshape(-1, 11)[:, :3]
+        if hasattr(skinned_mesh, "_apply_skinning_to_positions"):
+            skinned_positions = skinned_mesh._apply_skinning_to_positions(skinned_mesh.bone_matrices)[:, :3]
+        else:
+            skinned_positions = skinned_mesh.vertices[:, :3]
+        if len(static_positions) != len(skinned_positions):
+            return True
+        return float(numpy.max(numpy.abs(skinned_positions - static_positions))) > max_allowed_diff
+
+    def _compute_skinned_correction_matrix(self, submesh, animator, static_vertices, skinning_mode):
+        if static_vertices is None:
+            return numpy.identity(4, dtype=numpy.float32), float("inf")
+
+        static_positions = numpy.array(static_vertices, dtype=numpy.float32).reshape(-1, 11)[:, :3]
+        bind_positions = self._evaluate_skinned_bind_positions(submesh, animator, skinning_mode)
+        if len(bind_positions) != len(static_positions):
+            return numpy.identity(4, dtype=numpy.float32), float("inf")
+
+        source_augmented = numpy.concatenate(
+            [bind_positions, numpy.ones((len(bind_positions), 1), dtype=numpy.float32)],
+            axis=1,
+        )
+        affine_matrix, *_ = numpy.linalg.lstsq(source_augmented, static_positions, rcond=None)
+        fitted_positions = source_augmented @ affine_matrix
+        max_diff = float(numpy.max(numpy.abs(fitted_positions - static_positions)))
+
+        correction_matrix = numpy.identity(4, dtype=numpy.float32)
+        correction_matrix[:3, :3] = affine_matrix[:3, :].T
+        correction_matrix[:3, 3] = affine_matrix[3, :]
+        print(f"{submesh['name']} correction diff: {max_diff:.4f}")
+        return correction_matrix, max_diff
+
+    def _evaluate_skinned_bind_positions(self, submesh, animator, skinning_mode):
+        base_vertices = numpy.array(submesh["vertices"], dtype=numpy.float32).reshape(-1, 19)
+        position4 = numpy.concatenate(
+            [base_vertices[:, :3], numpy.ones((len(base_vertices), 1), dtype=numpy.float32)],
+            axis=1,
+        )
+        joint_ids = base_vertices[:, 11:15].astype(numpy.int32)
+        joint_weights = base_vertices[:, 15:19].astype(numpy.float32)
+        bone_matrices = animator.get_skin_matrices(
+            submesh["skin_index"],
+            submesh["mesh_bind_matrix"],
+            mode=skinning_mode,
+        )
+        selected_bones = bone_matrices[joint_ids]
+        skin_matrices = (selected_bones * joint_weights[:, :, numpy.newaxis, numpy.newaxis]).sum(axis=1)
+        skinned_positions = numpy.einsum("nij,nj->ni", skin_matrices, position4)
+        bind_positions = numpy.einsum(
+            "ij,nj->ni",
+            numpy.array(submesh["mesh_bind_matrix"], dtype=numpy.float32),
+            skinned_positions,
+        )
+        return bind_positions[:, :3]
+
     def _cleanup(self):
         if self.cleaned_up:
             return
 
         self.cleaned_up = True
-        glDeleteProgram(self.shaders[0])
-        glDeleteProgram(self.shaders[1])
+        [glDeleteProgram(shader) for shader in self.shaders]
         self.crate_texture.destroy()
         self.ground_texture.destroy()
         [material.destroy() for material in self.terrain_materials]

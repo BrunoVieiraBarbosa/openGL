@@ -971,6 +971,29 @@ class Mesh:
         scale_matrix = pyrr.matrix44.create_from_scale(scale, dtype=numpy.float32)
         return numpy.matmul(numpy.matmul(translation_matrix, rotation_matrix), scale_matrix)
 
+    @staticmethod
+    def _glb_node_matrix_cpu(node):
+        if "matrix" in node:
+            return numpy.array(node["matrix"], dtype=numpy.float32).reshape((4, 4)).T
+
+        translation = numpy.array(node.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32)
+        rotation = numpy.array(node.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32)
+        scale = numpy.array(node.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32)
+        x, y, z, w = rotation
+        rotation_matrix = numpy.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y), 0.0],
+                [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x), 0.0],
+                [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y), 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=numpy.float32,
+        )
+        translation_matrix = numpy.identity(4, dtype=numpy.float32)
+        translation_matrix[:3, 3] = translation
+        scale_matrix = numpy.diag([scale[0], scale[1], scale[2], 1.0]).astype(numpy.float32)
+        return translation_matrix @ rotation_matrix @ scale_matrix
+
 
     @staticmethod
     def _build_glb_primitive_vertices(document, binary_chunk, primitive, world_matrix):
@@ -1083,6 +1106,277 @@ class Mesh:
             visit(root_index, identity)
 
         return list(unique_positions.values())
+
+
+    @staticmethod
+    def load_glb_skinned_data(
+        file_name,
+        invert_texcoord=False,
+        target_size=1.0,
+        normalize=True,
+    ):
+        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        nodes = document.get("nodes", [])
+        node_parents = [-1] * len(nodes)
+        root_nodes = Mesh._get_glb_root_nodes(document)
+        submeshes = []
+
+        for parent_index, node in enumerate(nodes):
+            for child_index in node.get("children", []):
+                node_parents[child_index] = parent_index
+
+        default_local_matrices = [Mesh._glb_node_matrix_cpu(node) for node in nodes]
+        bind_world_matrices = Mesh._build_node_world_matrices(default_local_matrices, node_parents)
+
+        def visit(node_index):
+            node = nodes[node_index]
+            if "mesh" in node:
+                mesh_index = node["mesh"]
+                mesh_def = document["meshes"][mesh_index]
+                for primitive_index, primitive in enumerate(mesh_def.get("primitives", [])):
+                    if primitive.get("mode", 4) != 4:
+                        continue
+                    submeshes.append(
+                        {
+                            "name": f'{mesh_def.get("name", f"mesh_{mesh_index}")}_primitive_{primitive_index}',
+                            "material_index": -1 if primitive.get("material") is None else int(primitive["material"]),
+                            "mesh_node_index": node_index,
+                            "mesh_bind_matrix": bind_world_matrices[node_index].copy(),
+                            "skin_index": node.get("skin"),
+                            "vertices": Mesh._build_glb_skinned_primitive_vertices(
+                                document,
+                                binary_chunk,
+                                primitive,
+                                invert_texcoord=invert_texcoord,
+                            ),
+                        }
+                    )
+
+            for child_index in node.get("children", []):
+                visit(child_index)
+
+        for root_index in root_nodes:
+            visit(root_index)
+
+        skins = []
+        for skin in document.get("skins", []):
+            joints = [int(joint_index) for joint_index in skin.get("joints", [])]
+            if "inverseBindMatrices" in skin:
+                inverse_bind_matrices = Mesh._read_glb_accessor(
+                    document,
+                    binary_chunk,
+                    skin["inverseBindMatrices"],
+                ).reshape((-1, 4, 4)).transpose((0, 2, 1))
+            else:
+                inverse_bind_matrices = numpy.repeat(
+                    numpy.identity(4, dtype=numpy.float32)[numpy.newaxis, :, :],
+                    len(joints),
+                    axis=0,
+                )
+            skins.append(
+                {
+                    "joints": joints,
+                    "inverse_bind_matrices": inverse_bind_matrices.astype(numpy.float32),
+                }
+            )
+
+        animations = {}
+        for animation_index, animation in enumerate(document.get("animations", [])):
+            channels_by_node = {}
+            duration = 0.0
+            for channel in animation.get("channels", []):
+                sampler = animation["samplers"][channel["sampler"]]
+                node_index = int(channel["target"]["node"])
+                path = channel["target"]["path"]
+                times = Mesh._read_glb_accessor(document, binary_chunk, sampler["input"]).reshape(-1)
+                values = Mesh._read_glb_accessor(document, binary_chunk, sampler["output"])
+                channels_by_node.setdefault(node_index, {})[path] = {
+                    "times": times.astype(numpy.float32),
+                    "values": values.astype(numpy.float32),
+                    "interpolation": sampler.get("interpolation", "LINEAR"),
+                }
+                if len(times) > 0:
+                    duration = max(duration, float(times[-1]))
+
+            animation_name = animation.get("name") or f"animation_{animation_index}"
+            animations[animation_name] = {
+                "name": animation_name,
+                "duration": duration,
+                "channels": channels_by_node,
+            }
+
+        node_transforms = []
+        for node in nodes:
+            node_transforms.append(
+                {
+                    "name": node.get("name"),
+                    "translation": numpy.array(node.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32),
+                    "rotation": numpy.array(node.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32),
+                    "scale": numpy.array(node.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32),
+                }
+            )
+
+        return {
+            "submeshes": submeshes,
+            "skins": skins,
+            "animations": animations,
+            "node_transforms": node_transforms,
+            "node_parents": node_parents,
+            "transform": Mesh._calculate_skinned_model_transform(
+                submeshes,
+                target_size=target_size,
+                normalize=normalize,
+            ),
+        }
+
+
+    @staticmethod
+    def _get_glb_root_nodes(document):
+        nodes = document.get("nodes", [])
+        scene_index = document.get("scene", 0)
+        scenes = document.get("scenes", [])
+        if scenes and 0 <= scene_index < len(scenes):
+            return scenes[scene_index].get("nodes", [])
+        return list(range(len(nodes)))
+
+
+    @staticmethod
+    def _build_node_world_matrices(local_matrices, node_parents):
+        world_matrices = [None] * len(local_matrices)
+
+        def resolve(node_index):
+            if world_matrices[node_index] is not None:
+                return world_matrices[node_index]
+
+            parent_index = node_parents[node_index]
+            local_matrix = local_matrices[node_index]
+            if parent_index >= 0:
+                world_matrices[node_index] = numpy.matmul(resolve(parent_index), local_matrix)
+            else:
+                world_matrices[node_index] = local_matrix
+            return world_matrices[node_index]
+
+        for node_index in range(len(local_matrices)):
+            resolve(node_index)
+
+        return [matrix.astype(numpy.float32) for matrix in world_matrices]
+
+
+    @staticmethod
+    def _build_glb_skinned_primitive_vertices(document, binary_chunk, primitive, invert_texcoord=False):
+        attributes = primitive.get("attributes", {})
+        positions = Mesh._read_glb_accessor(document, binary_chunk, attributes["POSITION"])
+        texcoords = Mesh._read_glb_accessor(document, binary_chunk, attributes["TEXCOORD_0"]) if "TEXCOORD_0" in attributes else None
+        normals = Mesh._read_glb_accessor(document, binary_chunk, attributes["NORMAL"]) if "NORMAL" in attributes else None
+        joints = Mesh._read_glb_accessor(document, binary_chunk, attributes["JOINTS_0"]) if "JOINTS_0" in attributes else None
+        weights = Mesh._read_glb_accessor(document, binary_chunk, attributes["WEIGHTS_0"]) if "WEIGHTS_0" in attributes else None
+
+        if "indices" in primitive:
+            indices = Mesh._read_glb_accessor(document, binary_chunk, primitive["indices"]).reshape(-1).astype(numpy.int32)
+        else:
+            indices = numpy.arange(len(positions), dtype=numpy.int32)
+
+        vertices = []
+        for triangle_start in range(0, len(indices), 3):
+            triangle_indices = indices[triangle_start:triangle_start + 3]
+            if len(triangle_indices) < 3:
+                continue
+
+            tangent = Mesh._calculate_triangle_tangent(
+                positions[int(triangle_indices[0])],
+                positions[int(triangle_indices[1])],
+                positions[int(triangle_indices[2])],
+                texcoords[int(triangle_indices[0])] if texcoords is not None else numpy.array([0.0, 0.0], dtype=numpy.float32),
+                texcoords[int(triangle_indices[1])] if texcoords is not None else numpy.array([0.0, 0.0], dtype=numpy.float32),
+                texcoords[int(triangle_indices[2])] if texcoords is not None else numpy.array([0.0, 0.0], dtype=numpy.float32),
+                normals[int(triangle_indices[0])] if normals is not None else numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32),
+            )
+
+            for vertex_index in triangle_indices:
+                vertex_index = int(vertex_index)
+                position = positions[vertex_index]
+                uv = texcoords[vertex_index] if texcoords is not None else numpy.array([0.0, 0.0], dtype=numpy.float32)
+                if invert_texcoord:
+                    uv = numpy.array([uv[0], 1.0 - uv[1]], dtype=numpy.float32)
+                normal = normals[vertex_index] if normals is not None else numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32)
+                normal_norm = max(float(numpy.linalg.norm(normal)), 1e-6)
+                normal = normal / normal_norm
+
+                joint_values = joints[vertex_index] if joints is not None else numpy.array([0.0, 0.0, 0.0, 0.0], dtype=numpy.float32)
+                weight_values = weights[vertex_index] if weights is not None else numpy.array([1.0, 0.0, 0.0, 0.0], dtype=numpy.float32)
+                weight_sum = float(numpy.sum(weight_values))
+                if weight_sum > 1e-6:
+                    weight_values = weight_values / weight_sum
+                else:
+                    weight_values = numpy.array([1.0, 0.0, 0.0, 0.0], dtype=numpy.float32)
+
+                vertices.extend((float(position[0]), float(position[1]), float(position[2])))
+                vertices.extend((float(uv[0]), float(uv[1])))
+                vertices.extend((float(normal[0]), float(normal[1]), float(normal[2])))
+                vertices.extend((float(tangent[0]), float(tangent[1]), float(tangent[2])))
+                vertices.extend(float(value) for value in joint_values[:4])
+                vertices.extend(float(value) for value in weight_values[:4])
+
+        return vertices
+
+
+    @staticmethod
+    def _calculate_triangle_tangent(p0, p1, p2, uv0, uv1, uv2, normal):
+        edge1 = p1 - p0
+        edge2 = p2 - p0
+        delta_uv1 = uv1 - uv0
+        delta_uv2 = uv2 - uv0
+        denominator = (delta_uv1[0] * delta_uv2[1]) - (delta_uv2[0] * delta_uv1[1])
+
+        if abs(float(denominator)) < 1e-6:
+            tangent = numpy.cross(normal, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32))
+            if numpy.linalg.norm(tangent) < 1e-6:
+                tangent = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
+        else:
+            tangent = ((delta_uv2[1] * edge1) - (delta_uv1[1] * edge2)) / denominator
+
+        tangent_norm = max(float(numpy.linalg.norm(tangent)), 1e-6)
+        return tangent.astype(numpy.float32) / tangent_norm
+
+
+    @staticmethod
+    def _calculate_skinned_model_transform(submeshes, target_size=1.0, normalize=True):
+        if not submeshes:
+            return {
+                "scale": 1.0,
+                "origin_offset": numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32),
+            }
+
+        positions = []
+        for submesh in submeshes:
+            vertices = submesh["vertices"]
+            mesh_bind_matrix = numpy.array(submesh["mesh_bind_matrix"], dtype=numpy.float32)
+            positions.extend(
+                (mesh_bind_matrix @ numpy.array([*vertices[index:index + 3], 1.0], dtype=numpy.float32))[:3]
+                for index in range(0, len(vertices), 19)
+            )
+
+        if not positions:
+            return 1.0
+
+        positions = numpy.array(positions, dtype=numpy.float32)
+        min_corner = positions.min(axis=0)
+        max_corner = positions.max(axis=0)
+        if not normalize:
+            return {
+                "scale": 1.0,
+                "origin_offset": numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32),
+            }
+        size = max_corner - min_corner
+        max_dimension = max(float(size.max()), 1e-6)
+        center_xy = (min_corner[:2] + max_corner[:2]) / 2.0
+        return {
+            "scale": float(target_size) / max_dimension,
+            "origin_offset": numpy.array(
+                [-center_xy[0], -center_xy[1], -min_corner[2]],
+                dtype=numpy.float32,
+            ),
+        }
 
 
     @staticmethod
@@ -1354,6 +1648,324 @@ class Mesh:
         glDeleteVertexArrays(1, (self.vao,))
         glDeleteBuffers(1,(self.vbo,))
 
+
+
+class SkinnedAnimator:
+    def __init__(self, node_transforms, node_parents, animations, skins) -> None:
+        self.node_transforms = node_transforms
+        self.node_parents = node_parents
+        self.animations = animations
+        self.skins = skins
+        self.current_animation_name = None
+        self.current_animation = None
+        self.current_time = 0.0
+        self.loop = True
+        self.paused = False
+        self.world_matrices = self._compute_world_matrices()
+
+    def has_animation(self, name):
+        return name in self.animations
+
+    def play(self, name, loop=True, paused=False, restart=False, hold_time=None):
+        if name not in self.animations:
+            return False
+
+        if restart or self.current_animation_name != name:
+            self.current_time = 0.0 if hold_time is None else float(hold_time)
+
+        self.current_animation_name = name
+        self.current_animation = self.animations[name]
+        self.loop = bool(loop)
+        self.paused = bool(paused)
+
+        if hold_time is not None:
+            self.current_time = float(hold_time)
+
+        self.world_matrices = self._compute_world_matrices()
+        return True
+
+    def update(self, delta_time):
+        if self.current_animation is not None and not self.paused:
+            duration = float(self.current_animation["duration"])
+            if duration > 0.0:
+                self.current_time += float(delta_time)
+                if self.loop:
+                    self.current_time %= duration
+                else:
+                    self.current_time = min(self.current_time, duration)
+
+        self.world_matrices = self._compute_world_matrices()
+
+    def get_skin_matrices(self, skin_index, mesh_bind_matrix, mode="standard"):
+        if skin_index is None or skin_index < 0 or skin_index >= len(self.skins):
+            return numpy.identity(4, dtype=numpy.float32).reshape((1, 4, 4))
+
+        skin = self.skins[skin_index]
+        joint_matrices = []
+        for joint_node_index, inverse_bind_matrix in zip(skin["joints"], skin["inverse_bind_matrices"]):
+            joint_world = self.world_matrices[joint_node_index]
+            joint_matrices.append(numpy.matmul(joint_world, inverse_bind_matrix))
+        return numpy.array(joint_matrices, dtype=numpy.float32)
+
+    def _compute_world_matrices(self):
+        local_matrices = []
+        for node_index, transform in enumerate(self.node_transforms):
+            channels = None if self.current_animation is None else self.current_animation["channels"].get(node_index)
+
+            translation = numpy.array(transform.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32)
+            rotation = numpy.array(transform.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32)
+            scale = numpy.array(transform.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32)
+
+            if channels is not None:
+                if "translation" in channels:
+                    translation = self._sample_channel(channels["translation"], self.current_time)
+                if "rotation" in channels:
+                    rotation = self._sample_channel(channels["rotation"], self.current_time)
+                    rotation_norm = max(float(numpy.linalg.norm(rotation)), 1e-6)
+                    rotation = rotation / rotation_norm
+                if "scale" in channels:
+                    scale = self._sample_channel(channels["scale"], self.current_time)
+
+            local_matrices.append(
+                Mesh._glb_node_matrix_cpu(
+                    {
+                        "translation": translation.tolist(),
+                        "rotation": rotation.tolist(),
+                        "scale": scale.tolist(),
+                    }
+                )
+            )
+
+        return Mesh._build_node_world_matrices(local_matrices, self.node_parents)
+
+    def _sample_channel(self, channel, time_value):
+        times = channel["times"]
+        values = channel["values"]
+        interpolation = channel.get("interpolation", "LINEAR")
+
+        if len(times) == 0:
+            return values[0]
+        if len(times) == 1 or time_value <= float(times[0]):
+            return values[0]
+        if time_value >= float(times[-1]):
+            return values[-1]
+
+        next_index = int(numpy.searchsorted(times, time_value, side="right"))
+        prev_index = max(next_index - 1, 0)
+        next_index = min(next_index, len(times) - 1)
+
+        prev_time = float(times[prev_index])
+        next_time = float(times[next_index])
+        if next_time <= prev_time:
+            return values[next_index]
+
+        factor = (float(time_value) - prev_time) / (next_time - prev_time)
+        if interpolation == "STEP":
+            return values[prev_index]
+
+        if values.shape[1] == 4:
+            return self._slerp(values[prev_index], values[next_index], factor)
+        return ((1.0 - factor) * values[prev_index]) + (factor * values[next_index])
+
+    @staticmethod
+    def _slerp(start, end, factor):
+        start = start.astype(numpy.float32)
+        end = end.astype(numpy.float32)
+        dot = float(numpy.dot(start, end))
+
+        if dot < 0.0:
+            end = -end
+            dot = -dot
+
+        if dot > 0.9995:
+            result = start + factor * (end - start)
+            result_norm = max(float(numpy.linalg.norm(result)), 1e-6)
+            return result / result_norm
+
+        theta_0 = numpy.arccos(dot)
+        sin_theta_0 = numpy.sin(theta_0)
+        theta = theta_0 * factor
+        sin_theta = numpy.sin(theta)
+
+        s0 = numpy.sin(theta_0 - theta) / sin_theta_0
+        s1 = sin_theta / sin_theta_0
+        return (s0 * start) + (s1 * end)
+
+
+class SkinnedMesh(Mesh):
+    def __init__(
+        self,
+        shader,
+        material,
+        position,
+        vertices,
+        animator,
+        skin_index,
+        mesh_bind_matrix,
+        skinning_mode="standard",
+        post_skinning_transform=None,
+        origin_offset=None,
+        scale=1.0,
+    ) -> None:
+        self.material = material
+        self.shader = shader
+        self.position = position
+        self.scale = scale
+        self.animator = animator
+        self.skin_index = skin_index
+        self.mesh_bind_matrix = numpy.array(mesh_bind_matrix, dtype=numpy.float32)
+        self.skinning_mode = skinning_mode
+        if post_skinning_transform is None:
+            post_skinning_transform = numpy.identity(4, dtype=numpy.float32)
+        self.post_skinning_transform = numpy.array(post_skinning_transform, dtype=numpy.float32)
+        if origin_offset is None:
+            origin_offset = [0.0, 0.0, 0.0]
+        self.origin_offset = numpy.array(origin_offset, dtype=numpy.float32)
+        self.collider_mode = "aabb"
+        self.collider_radius_scale = 0.45
+        self.collider_radius_padding = 0.0
+        self.collider_height_padding = 0.0
+        self.rotation = [0, 0, 0]
+        self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
+        self.model = None
+        glUseProgram(self.shader)
+
+        self.base_vertex_size = 19
+        self.vertex_size = 11
+        self.base_vertices = numpy.array(vertices, dtype=numpy.float32).reshape(-1, self.base_vertex_size)
+        self.base_positions = self.base_vertices[:, 0:3]
+        self.base_uvs = self.base_vertices[:, 3:5]
+        self.base_normals = self.base_vertices[:, 5:8]
+        self.base_tangents = self.base_vertices[:, 8:11]
+        self.base_joint_ids = self.base_vertices[:, 11:15].astype(numpy.int32)
+        self.base_joint_weights = self.base_vertices[:, 15:19].astype(numpy.float32)
+        self.position4 = numpy.concatenate(
+            [self.base_positions, numpy.ones((len(self.base_vertices), 1), dtype=numpy.float32)],
+            axis=1,
+        )
+        self.vertex_count = len(self.base_vertices)
+        self.vertices = numpy.array(vertices, dtype=numpy.float32).reshape(-1, self.base_vertex_size)
+        self.bone_matrices = self._compute_bone_matrices()
+        self.local_bounds = self._compute_bind_local_bounds()
+        self.local_bounds = (
+            self.local_bounds[0] + self.origin_offset,
+            self.local_bounds[1] + self.origin_offset,
+        )
+
+        self.vao = glGenVertexArrays(1)
+        glBindVertexArray(self.vao)
+        self.vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        initial_buffer = numpy.ascontiguousarray(self.vertices, dtype=numpy.float32).ravel()
+        glBufferData(GL_ARRAY_BUFFER, initial_buffer.nbytes, initial_buffer, GL_DYNAMIC_DRAW)
+
+        stride = self.base_vertex_size * 4
+
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(20))
+
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(32))
+
+        glEnableVertexAttribArray(4)
+        glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(44))
+
+        glEnableVertexAttribArray(5)
+        glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(60))
+
+    def draw(self):
+        glUseProgram(self.shader)
+        self.material.use()
+        if self.model is None:
+            self.model = self._build_model_matrix(self.identity)
+
+        glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(
+            glGetUniformLocation(self.shader, "meshBindMatrix"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(self.mesh_bind_matrix.T, dtype=numpy.float32),
+        )
+        glUniformMatrix4fv(
+            glGetUniformLocation(self.shader, "postSkinningTransform"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(self.post_skinning_transform.T, dtype=numpy.float32),
+        )
+        glUniform1i(glGetUniformLocation(self.shader, "boneCount"), int(len(self.bone_matrices)))
+        if len(self.bone_matrices) > 0:
+            glUniformMatrix4fv(
+                glGetUniformLocation(self.shader, "boneMatrices"),
+                len(self.bone_matrices),
+                GL_FALSE,
+                numpy.ascontiguousarray(self.bone_matrices.transpose((0, 2, 1)), dtype=numpy.float32),
+            )
+        glBindVertexArray(self.vao)
+        glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
+
+    def _build_model_matrix(self, rotation_matrix):
+        scale_vector = numpy.array([self.scale, self.scale, self.scale], dtype=numpy.float32)
+        scale_matrix = pyrr.matrix44.create_from_scale(scale_vector, dtype=numpy.float32)
+        local_offset_matrix = pyrr.matrix44.create_from_translation(self.origin_offset, dtype=numpy.float32)
+        translation_matrix = pyrr.matrix44.create_from_translation(vec=numpy.array(self.position), dtype=numpy.float32)
+        model = pyrr.matrix44.multiply(local_offset_matrix, rotation_matrix)
+        model = pyrr.matrix44.multiply(scale_matrix, model)
+        return pyrr.matrix44.multiply(model, translation_matrix)
+
+    def _compute_bind_local_bounds(self):
+        bind_positions = self._apply_skinning_to_positions(self.bone_matrices)
+        positions = bind_positions[:, :3]
+        return positions.min(axis=0), positions.max(axis=0)
+
+    def update_skinning(self):
+        self.bone_matrices = self._compute_bone_matrices()
+
+    def _compute_bone_matrices(self):
+        bone_matrices = self.animator.get_skin_matrices(
+            self.skin_index,
+            self.mesh_bind_matrix,
+            mode=self.skinning_mode,
+        )
+        return numpy.ascontiguousarray(bone_matrices, dtype=numpy.float32)
+
+    def _apply_skinning_to_positions(self, bone_matrices):
+        selected_bones = bone_matrices[self.base_joint_ids]
+        skin_matrices = (selected_bones * self.base_joint_weights[:, :, numpy.newaxis, numpy.newaxis]).sum(axis=1)
+        skinned_positions = numpy.einsum("nij,nj->ni", skin_matrices, self.position4)
+        bind_positions = numpy.einsum("ij,nj->ni", self.mesh_bind_matrix, skinned_positions)
+        corrected_positions = numpy.einsum("ij,nj->ni", self.post_skinning_transform, bind_positions)
+        return corrected_positions
+
+
+class SkinnedModel:
+    def __init__(self, meshes, materials, animator) -> None:
+        self.meshes = meshes
+        self.materials = materials
+        self.animator = animator
+
+    def has_animation(self, name):
+        return self.animator.has_animation(name)
+
+    def play(self, name, loop=True, paused=False, restart=False, hold_time=None):
+        return self.animator.play(
+            name,
+            loop=loop,
+            paused=paused,
+            restart=restart,
+            hold_time=hold_time,
+        )
+
+    def update(self, delta_time):
+        self.animator.update(delta_time)
+        for mesh in self.meshes:
+            if hasattr(mesh, "update_skinning"):
+                mesh.update_skinning()
 
 
 class MeshRGB:

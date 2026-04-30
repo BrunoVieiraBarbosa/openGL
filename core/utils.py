@@ -13,6 +13,7 @@ class PlayerController:
         terrain_bounds=None,
         ground_height_fn=None,
         terrain_contains_fn=None,
+        always_play_walk=False,
     ) -> None:
         self.camera = camera
         self.shaders = shaders
@@ -74,6 +75,7 @@ class PlayerFirstPerson(PlayerController):
         terrain_bounds=None,
         ground_height_fn=None,
         terrain_contains_fn=None,
+        always_play_walk=False,
     ) -> None:
         super().__init__(
             camera,
@@ -130,6 +132,7 @@ class PlayerThirdPerson(PlayerController):
         player_mesh,
         position,
         visual_meshes=None,
+        animated_visual=None,
         mesh_rotation_offset=None,
         mesh_position_offset=None,
         mesh_heading_offset=-90.0,
@@ -137,6 +140,7 @@ class PlayerThirdPerson(PlayerController):
         terrain_bounds=None,
         ground_height_fn=None,
         terrain_contains_fn=None,
+        always_play_walk=False,
     ) -> None:
         super().__init__(
             camera,
@@ -148,23 +152,29 @@ class PlayerThirdPerson(PlayerController):
         )
         self.player_mesh = player_mesh
         self.visual_meshes = visual_meshes or [player_mesh]
+        self.animated_visual = animated_visual
         self.position = numpy.array(position, dtype=numpy.float32)
         self.mesh_rotation_offset = mesh_rotation_offset or (0.0, 0.0, 0.0)
         self.mesh_position_offset = numpy.array(mesh_position_offset or (0.0, 0.0, 0.0), dtype=numpy.float32)
         self.mesh_heading_offset = float(mesh_heading_offset)
+        self.always_play_walk = bool(always_play_walk)
         self.speed = 4.6
         self.radius = 0.52
         self.character_height = 1.3
         self.look_sensitivity = 0.18
         self.facing_yaw = self.camera.theta
         self.last_world_direction = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
+        self.active_animation_state = None
         self.camera.update_focus(self.position)
         self._sync_visuals()
 
     def update(self, delta_time):
         move_vector = self._get_move_vector()
-        if numpy.linalg.norm(move_vector[:2]) > 1e-6:
+        is_moving = numpy.linalg.norm(move_vector[:2]) > 1e-6
+        if is_moving:
             self._move(move_vector * self.speed * delta_time)
+
+        self._update_animation(delta_time, is_moving)
 
         self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
         self.position[2] = self.ground_height
@@ -220,6 +230,46 @@ class PlayerThirdPerson(PlayerController):
 
         current_position[2] = self._sample_ground_height(current_position[0], current_position[1])
         self.position = current_position
+
+    def _update_animation(self, delta_time, is_moving):
+        if self.animated_visual is None:
+            return
+
+        has_walk = self.animated_visual.has_animation("walk")
+        has_idle = self.animated_visual.has_animation("idle")
+        if not has_walk and not has_idle:
+            return
+
+        target_state = "walk" if (is_moving or self.always_play_walk) else "idle"
+        if target_state == "walk" and not has_walk:
+            target_state = "idle"
+
+        if target_state == "idle":
+            if has_idle:
+                self.animated_visual.play(
+                    "idle",
+                    loop=True,
+                    paused=False,
+                    restart=self.active_animation_state != "idle",
+                )
+            elif has_walk:
+                self.animated_visual.play(
+                    "walk",
+                    loop=True,
+                    paused=True,
+                    restart=self.active_animation_state != "idle",
+                    hold_time=0.0,
+                )
+        elif target_state == "walk":
+            self.animated_visual.play(
+                "walk",
+                loop=True,
+                paused=False,
+                restart=self.active_animation_state != "walk",
+            )
+
+        self.active_animation_state = target_state
+        self.animated_visual.update(delta_time)
 
     def _sync_visuals(self):
         mesh_position = self.position + self.mesh_position_offset
