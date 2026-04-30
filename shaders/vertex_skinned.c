@@ -13,7 +13,6 @@ uniform mat4 view;
 uniform mat4 projection;
 uniform mat4 meshBindMatrix;
 uniform mat4 postSkinningTransform;
-uniform mat4 lightSpaceMatrix;
 uniform int boneCount;
 uniform mat4 boneMatrices[128];
 
@@ -21,7 +20,6 @@ layout (location=0) out vec3 fragmentPos;
 layout (location=1) out vec2 fragmentTexCoord;
 layout (location=2) out vec3 fragmentNormal;
 layout (location=3) out vec3 fragmentTangent;
-layout (location=4) out vec4 fragmentLightSpacePos;
 
 mat4 sampleSkinMatrix()
 {
@@ -59,5 +57,4 @@ void main()
     mat3 normalMatrix = transpose(inverse(mat3(model)));
     fragmentNormal = normalize(normalMatrix * skinnedNormal);
     fragmentTangent = normalize(normalMatrix * skinnedTangent);
-    fragmentLightSpacePos = lightSpaceMatrix * vec4(fragmentPos, 1.0);
 }

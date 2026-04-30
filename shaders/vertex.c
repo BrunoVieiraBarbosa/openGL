@@ -9,13 +9,11 @@ layout (location=3) in vec3 vertexTangent;
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
-uniform mat4 lightSpaceMatrix;
 
 layout (location=0) out vec3 fragmentPos;
 layout (location=1) out vec2 fragmentTexCoord;
 layout (location=2) out vec3 fragmentNormal;
 layout (location=3) out vec3 fragmentTangent;
-layout (location=4) out vec4 fragmentLightSpacePos;
 
 
 void main()
@@ -26,5 +24,4 @@ void main()
     mat3 normalMatrix = transpose(inverse(mat3(model)));
     fragmentNormal = normalize(normalMatrix * vertexNormal);
     fragmentTangent = normalize(normalMatrix * vertexTangent);
-    fragmentLightSpacePos = lightSpaceMatrix * vec4(fragmentPos, 1.0);
 }
