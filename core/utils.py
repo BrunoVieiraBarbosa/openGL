@@ -158,7 +158,9 @@ class PlayerThirdPerson(PlayerController):
         self.mesh_position_offset = numpy.array(mesh_position_offset or (0.0, 0.0, 0.0), dtype=numpy.float32)
         self.mesh_heading_offset = float(mesh_heading_offset)
         self.always_play_walk = bool(always_play_walk)
-        self.speed = 1.8
+        self.walk_speed = 1.8
+        self.run_speed = 4.8
+        self.speed = self.walk_speed
         self.radius = 0.52
         self.character_height = 1.3
         self.look_sensitivity = 0.18
@@ -173,11 +175,13 @@ class PlayerThirdPerson(PlayerController):
     def update(self, delta_time):
         move_vector = self._get_move_vector()
         is_moving = numpy.linalg.norm(move_vector[:2]) > 1e-6
+        is_running = is_moving and self._is_run_pressed()
+        self.speed = self.run_speed if is_running else self.walk_speed
         self._update_facing(delta_time)
         if is_moving:
             move_scale = self._get_turn_movement_factor()
             self._move(move_vector * self.speed * delta_time * move_scale)
-        self._update_animation(delta_time, is_moving)
+        self._update_animation(delta_time, is_moving, is_running)
 
         self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
         self.position[2] = self.ground_height
@@ -250,16 +254,22 @@ class PlayerThirdPerson(PlayerController):
             return 0.0
         return float((110.0 - angle_delta) / 90.0)
 
-    def _update_animation(self, delta_time, is_moving):
+    def _is_run_pressed(self):
+        return arcade.key.LSHIFT in self.keys_down or arcade.key.RSHIFT in self.keys_down
+
+    def _update_animation(self, delta_time, is_moving, is_running):
         if self.animated_visual is None:
             return
 
         has_walk = self.animated_visual.has_animation("walk")
+        has_run = self.animated_visual.has_animation("run")
         has_idle = self.animated_visual.has_animation("idle")
-        if not has_walk and not has_idle:
+        if not has_walk and not has_run and not has_idle:
             return
 
-        target_state = "walk" if (is_moving or self.always_play_walk) else "idle"
+        target_state = "run" if is_running else ("walk" if (is_moving or self.always_play_walk) else "idle")
+        if target_state == "run" and not has_run:
+            target_state = "walk"
         if target_state == "walk" and not has_walk:
             target_state = "idle"
 
@@ -285,6 +295,13 @@ class PlayerThirdPerson(PlayerController):
                 loop=True,
                 paused=False,
                 restart=self.active_animation_state != "walk",
+            )
+        elif target_state == "run":
+            self.animated_visual.play(
+                "run",
+                loop=True,
+                paused=False,
+                restart=self.active_animation_state != "run",
             )
 
         self.active_animation_state = target_state
