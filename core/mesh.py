@@ -1642,6 +1642,20 @@ class Mesh:
         glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
+
+    def draw_shadow(self, shadow_shader, light_space_matrix):
+        glUseProgram(shadow_shader)
+        if type(self.model) == type(None):
+            self.model = self._build_model_matrix(self.identity)
+        glUniformMatrix4fv(glGetUniformLocation(shadow_shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(
+            glGetUniformLocation(shadow_shader, "lightSpaceMatrix"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(light_space_matrix, dtype=numpy.float32),
+        )
+        glBindVertexArray(self.vao)
+        glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
     
 
     def destroy(self):
@@ -1909,6 +1923,40 @@ class SkinnedMesh(Mesh):
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
 
+    def draw_shadow(self, shadow_shader, light_space_matrix):
+        glUseProgram(shadow_shader)
+        if self.model is None:
+            self.model = self._build_model_matrix(self.identity)
+        glUniformMatrix4fv(glGetUniformLocation(shadow_shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(
+            glGetUniformLocation(shadow_shader, "lightSpaceMatrix"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(light_space_matrix, dtype=numpy.float32),
+        )
+        glUniformMatrix4fv(
+            glGetUniformLocation(shadow_shader, "meshBindMatrix"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(self.mesh_bind_matrix.T, dtype=numpy.float32),
+        )
+        glUniformMatrix4fv(
+            glGetUniformLocation(shadow_shader, "postSkinningTransform"),
+            1,
+            GL_FALSE,
+            numpy.ascontiguousarray(self.post_skinning_transform.T, dtype=numpy.float32),
+        )
+        glUniform1i(glGetUniformLocation(shadow_shader, "boneCount"), int(len(self.bone_matrices)))
+        if len(self.bone_matrices) > 0:
+            glUniformMatrix4fv(
+                glGetUniformLocation(shadow_shader, "boneMatrices"),
+                len(self.bone_matrices),
+                GL_FALSE,
+                numpy.ascontiguousarray(self.bone_matrices.transpose((0, 2, 1)), dtype=numpy.float32),
+            )
+        glBindVertexArray(self.vao)
+        glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
+
     def _build_model_matrix(self, rotation_matrix):
         scale_vector = numpy.array([self.scale, self.scale, self.scale], dtype=numpy.float32)
         scale_matrix = pyrr.matrix44.create_from_scale(scale_vector, dtype=numpy.float32)
@@ -1977,11 +2025,13 @@ class MeshRGB:
         color=[1, 1, 1],
         scale=1.0,
         billboard_target=None,
+        alpha=1.0,
     ) -> None:
         self.shader = shader
         self.position = position
         self.scale = scale
         self.billboard_target = billboard_target
+        self.alpha = float(alpha)
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
         glUseProgram(self.shader)
@@ -1990,45 +2040,58 @@ class MeshRGB:
             self.vertices = vertices
         else:
             self.vertices = (
-                -0.1, 0.1, -0.1, *color, 
-                0.1, 0.1, 0.1, *color,   
-                0.1, 0.1, -0.1, *color,
-                0.1, 0.1, 0.1, *color,
-                -0.1, -0.1, 0.1, *color,
-                0.1, -0.1, 0.1, *color,
-                -0.1, 0.1, 0.1, *color,
-                -0.1, -0.1, -0.1, *color,
-                -0.1, -0.1, 0.1, *color,
-                0.1, -0.1, -0.1, *color,
-                -0.1, -0.1, 0.1, *color,
-                -0.1, -0.1, -0.1, *color,
-                0.1, 0.1, -0.1, *color,
-                0.1, -0.1, 0.1, *color,
-                0.1, -0.1, -0.1, *color,
-                -0.1, 0.1, -0.1,*color,
-                0.1, -0.1, -0.1,*color,
-                -0.1, -0.1, -0.1,*color,
-                -0.1, 0.1, -0.1,*color,
-                -0.1, 0.1, 0.1,*color,
-                0.1, 0.1, 0.1,*color,
-                0.1, 0.1, 0.1,*color,
-                -0.1, 0.1, 0.1,*color,
-                -0.1, -0.1, 0.1,*color,
-                -0.1, 0.1, 0.1,*color,
-                -0.1, 0.1, -0.1,*color,
-                -0.1, -0.1, -0.1,*color,
-                0.1, -0.1, -0.1,*color,
-                0.1, -0.1, 0.1,*color,
-                -0.1, -0.1, 0.1,*color,
-                0.1, 0.1, -0.1,*color,
-                0.1, 0.1, 0.1,*color,
-                0.1, -0.1, 0.1,*color,
-                -0.1, 0.1, -0.1,*color,
-                0.1, 0.1, -0.1,*color,
-                0.1, -0.1, -0.1,*color,
+                -0.1, 0.1, -0.1, *color, 1.0,
+                0.1, 0.1, 0.1, *color, 1.0,
+                0.1, 0.1, -0.1, *color, 1.0,
+                0.1, 0.1, 0.1, *color, 1.0,
+                -0.1, -0.1, 0.1, *color, 1.0,
+                0.1, -0.1, 0.1, *color, 1.0,
+                -0.1, 0.1, 0.1, *color, 1.0,
+                -0.1, -0.1, -0.1, *color, 1.0,
+                -0.1, -0.1, 0.1, *color, 1.0,
+                0.1, -0.1, -0.1, *color, 1.0,
+                -0.1, -0.1, 0.1, *color, 1.0,
+                -0.1, -0.1, -0.1, *color, 1.0,
+                0.1, 0.1, -0.1, *color, 1.0,
+                0.1, -0.1, 0.1, *color, 1.0,
+                0.1, -0.1, -0.1, *color, 1.0,
+                -0.1, 0.1, -0.1, *color, 1.0,
+                0.1, -0.1, -0.1, *color, 1.0,
+                -0.1, -0.1, -0.1, *color, 1.0,
+                -0.1, 0.1, -0.1, *color, 1.0,
+                -0.1, 0.1, 0.1, *color, 1.0,
+                0.1, 0.1, 0.1, *color, 1.0,
+                0.1, 0.1, 0.1, *color, 1.0,
+                -0.1, 0.1, 0.1, *color, 1.0,
+                -0.1, -0.1, 0.1, *color, 1.0,
+                -0.1, 0.1, 0.1, *color, 1.0,
+                -0.1, 0.1, -0.1, *color, 1.0,
+                -0.1, -0.1, -0.1, *color, 1.0,
+                0.1, -0.1, -0.1, *color, 1.0,
+                0.1, -0.1, 0.1, *color, 1.0,
+                -0.1, -0.1, 0.1, *color, 1.0,
+                0.1, 0.1, -0.1, *color, 1.0,
+                0.1, 0.1, 0.1, *color, 1.0,
+                0.1, -0.1, 0.1, *color, 1.0,
+                -0.1, 0.1, -0.1, *color, 1.0,
+                0.1, 0.1, -0.1, *color, 1.0,
+                0.1, -0.1, -0.1, *color, 1.0,
             )
-        self.vertex_count = len(self.vertices)//6
         self.vertices = numpy.array(self.vertices, dtype=numpy.float32)
+        if len(self.vertices) % 7 == 0:
+            self.vertex_size = 7
+        elif len(self.vertices) % 6 == 0:
+            vertex_count = len(self.vertices) // 6
+            converted = numpy.zeros(vertex_count * 7, dtype=numpy.float32)
+            reshaped_source = self.vertices.reshape(vertex_count, 6)
+            reshaped_target = converted.reshape(vertex_count, 7)
+            reshaped_target[:, :6] = reshaped_source
+            reshaped_target[:, 6] = 1.0
+            self.vertices = converted
+            self.vertex_size = 7
+        else:
+            raise ValueError("MeshRGB vertices must be packed as xyzrgb or xyzrgba")
+        self.vertex_count = len(self.vertices) // self.vertex_size
 
         self.vao = glGenVertexArrays(1)
         glBindVertexArray(self.vao)
@@ -2037,17 +2100,17 @@ class MeshRGB:
         glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STATIC_DRAW)
 
         glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(0))
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, self.vertex_size * 4, ctypes.c_void_p(0))
 
         glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, self.vertex_size * 4, ctypes.c_void_p(12))
 
 
     @staticmethod
     def create_gradient_box(size=1.0, top_color=(0.55, 0.78, 0.98), bottom_color=(0.9, 0.82, 0.68)):
         half = size / 2
-        top = list(top_color)
-        bottom = list(bottom_color)
+        top = [*top_color, 1.0]
+        bottom = [*bottom_color, 1.0]
         return (
             -half,  half, -half, *top,
              half,  half,  half, *top,
@@ -2091,13 +2154,29 @@ class MeshRGB:
     @staticmethod
     def create_disc(radius=1.0, segments=24, color=(1.0, 0.9, 0.65)):
         vertices = []
-        center = [0.0, 0.0, 0.0, *color]
+        center = [0.0, 0.0, 0.0, *color, 1.0]
 
         for index in range(segments):
             angle0 = (2 * numpy.pi * index) / segments
             angle1 = (2 * numpy.pi * (index + 1)) / segments
-            p0 = [numpy.cos(angle0) * radius, numpy.sin(angle0) * radius, 0.0, *color]
-            p1 = [numpy.cos(angle1) * radius, numpy.sin(angle1) * radius, 0.0, *color]
+            p0 = [numpy.cos(angle0) * radius, numpy.sin(angle0) * radius, 0.0, *color, 1.0]
+            p1 = [numpy.cos(angle1) * radius, numpy.sin(angle1) * radius, 0.0, *color, 1.0]
+            vertices.extend(center)
+            vertices.extend(p0)
+            vertices.extend(p1)
+
+        return tuple(vertices)
+
+    @staticmethod
+    def create_soft_disc(radius=1.0, segments=64, color=(0.0, 0.0, 0.0), center_alpha=1.0, edge_alpha=0.0):
+        vertices = []
+        center = [0.0, 0.0, 0.0, *color, center_alpha]
+
+        for index in range(segments):
+            angle0 = (2 * numpy.pi * index) / segments
+            angle1 = (2 * numpy.pi * (index + 1)) / segments
+            p0 = [numpy.cos(angle0) * radius, numpy.sin(angle0) * radius, 0.0, *color, edge_alpha]
+            p1 = [numpy.cos(angle1) * radius, numpy.sin(angle1) * radius, 0.0, *color, edge_alpha]
             vertices.extend(center)
             vertices.extend(p0)
             vertices.extend(p1)
@@ -2147,6 +2226,9 @@ class MeshRGB:
             self.model = pyrr.matrix44.multiply(scale_matrix, translation_matrix)
 
         glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
+        alpha_location = glGetUniformLocation(self.shader, "alpha")
+        if alpha_location >= 0:
+            glUniform1f(alpha_location, self.alpha)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
     

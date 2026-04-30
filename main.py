@@ -8,6 +8,7 @@ from OpenGL.GL import *
 from core.core import *
 from core.light import DirectionalLight, PointLight
 from core.mesh import Mesh, MeshRGB, SkinnedAnimator, SkinnedMesh, SkinnedModel, TerrainGridSampler
+from core.shadows import SceneShadowController, ShadowSettings
 from core.utils import *
 
 # Diagnostic options for isolating scale vs skinning issues in Player.glb:
@@ -19,6 +20,20 @@ PLAYER_TARGET_SIZE = 1.9
 PLAYER_NORMALIZE = True
 PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
+SHADOW_SETTINGS = ShadowSettings(
+    enabled=True,
+    map_size=2048,
+    strength=0.7,
+    debug_mode=0,
+    disable_fog_debug=False,
+    ortho_padding=4.0,
+    focus_radius=16.0,
+    focus_forward=8.0,
+    focus_height=16.0,
+    ground_offset=3.0,
+    light_distance=36.0,
+    depth_padding=10.0,
+)
 
 
 class GameWindow(App):
@@ -51,7 +66,6 @@ class GameWindow(App):
         self.add_shader("first", Shader.create_shader("shaders/vertex.c", "shaders/fragment.c"))
         self.add_shader("simple", Shader.create_shader("shaders/vertex_rgb.c", "shaders/fragment_rgb.c"))
         self.add_shader("skinned", Shader.create_shader("shaders/vertex_skinned.c", "shaders/fragment.c"))
-
         self.start_()
 
         self.light = [
@@ -73,6 +87,18 @@ class GameWindow(App):
                 [True, False, True],
             ),
         ]
+        self.shadow_controller = SceneShadowController(
+            receiver_shaders=[self.shaders[0], self.shaders[2]],
+            shadow_shader=Shader.create_shader("shaders/shadow_vertex.c", "shaders/shadow_fragment.c"),
+            shadow_skinned_shader=Shader.create_shader("shaders/shadow_vertex_skinned.c", "shaders/shadow_fragment.c"),
+            light_direction_provider=lambda: self.light[0].direction,
+            focus_position_provider=lambda: self.player.position if hasattr(self, "player") else numpy.array([10.0, 0.0, 0.0], dtype=numpy.float32),
+            camera_heading_provider=lambda: self.camera.theta if hasattr(self, "camera") else 0.0,
+            shadow_mesh_iterator=self._iter_shadow_meshes,
+            window_size_provider=lambda: self.window_size,
+            skinned_mesh_type=SkinnedMesh,
+            settings=SHADOW_SETTINGS,
+        )
 
         self.lampada = [
             MeshRGB(self.shaders[1], self.light[1], color=[1, 0.95, 0.8]),
@@ -180,6 +206,16 @@ class GameWindow(App):
             always_play_walk=PLAYER_ALWAYS_PLAY_WALK,
         )
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
+
+    def _iter_shadow_meshes(self):
+        for mesh in self.player_meshes:
+            yield mesh
+        for cube in self.cubes:
+            yield cube
+        for primary in self.scene_meshes:
+            yield primary
+            for extra_mesh in getattr(primary, "extra_meshes", []):
+                yield extra_mesh
 
     def _build_glb_model(self, file_path, position, target_size, normalize=True, rotation_degrees=(0.0, 0.0, 0.0)):
         submeshes = Mesh.load_glb_submeshes_prepared(
@@ -409,10 +445,13 @@ class GameWindow(App):
         [x.destroy() for x in self.cubes]
         [x.destroy() for x in self.lampada]
         self.sky.destroy()
+        self.shadow_controller.destroy()
 
     def on_draw(self):
         self.clear()
+        self.shadow_controller.render_pass()
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self.shadow_controller.bind_texture()
         glDepthMask(GL_FALSE)
         self.sky.draw()
         glDepthMask(GL_TRUE)
@@ -436,6 +475,9 @@ class GameWindow(App):
     def on_key_press(self, symbol: int, modifiers: int):
         if symbol == arcade.key.ESCAPE:
             self.close()
+            return
+        if symbol == arcade.key.F3:
+            self.shadow_controller.cycle_debug_mode()
             return
 
         self.player.on_key_press(symbol)
