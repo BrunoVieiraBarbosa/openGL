@@ -158,7 +158,7 @@ class PlayerThirdPerson(PlayerController):
         self.mesh_position_offset = numpy.array(mesh_position_offset or (0.0, 0.0, 0.0), dtype=numpy.float32)
         self.mesh_heading_offset = float(mesh_heading_offset)
         self.always_play_walk = bool(always_play_walk)
-        self.speed = 4.6
+        self.speed = 1.8
         self.radius = 0.52
         self.character_height = 1.3
         self.look_sensitivity = 0.18
