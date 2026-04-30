@@ -163,6 +163,8 @@ class PlayerThirdPerson(PlayerController):
         self.character_height = 1.3
         self.look_sensitivity = 0.18
         self.facing_yaw = self.camera.theta
+        self.target_facing_yaw = float(self.camera.theta)
+        self.turn_speed = 220.0
         self.last_world_direction = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
         self.active_animation_state = None
         self.camera.update_focus(self.position)
@@ -171,9 +173,10 @@ class PlayerThirdPerson(PlayerController):
     def update(self, delta_time):
         move_vector = self._get_move_vector()
         is_moving = numpy.linalg.norm(move_vector[:2]) > 1e-6
+        self._update_facing(delta_time)
         if is_moving:
-            self._move(move_vector * self.speed * delta_time)
-
+            move_scale = self._get_turn_movement_factor()
+            self._move(move_vector * self.speed * delta_time * move_scale)
         self._update_animation(delta_time, is_moving)
 
         self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
@@ -203,7 +206,7 @@ class PlayerThirdPerson(PlayerController):
         # Character facing is derived directly from camera heading plus input direction.
         # This keeps W aligned with the current camera forward.
         input_angle = numpy.degrees(numpy.arctan2(-movement[0], movement[1]))
-        self.facing_yaw = float((self.camera.theta + input_angle) % 360.0)
+        self.target_facing_yaw = float((self.camera.theta + input_angle) % 360.0)
 
         camera_theta = numpy.radians(self.camera.theta)
         camera_forward = numpy.array(
@@ -230,6 +233,22 @@ class PlayerThirdPerson(PlayerController):
 
         current_position[2] = self._sample_ground_height(current_position[0], current_position[1])
         self.position = current_position
+
+    def _update_facing(self, delta_time):
+        angle_delta = ((self.target_facing_yaw - self.facing_yaw + 180.0) % 360.0) - 180.0
+        max_step = self.turn_speed * float(delta_time)
+        if abs(angle_delta) <= max_step:
+            self.facing_yaw = self.target_facing_yaw
+            return
+        self.facing_yaw = float((self.facing_yaw + numpy.sign(angle_delta) * max_step) % 360.0)
+
+    def _get_turn_movement_factor(self):
+        angle_delta = abs(((self.target_facing_yaw - self.facing_yaw + 180.0) % 360.0) - 180.0)
+        if angle_delta <= 20.0:
+            return 1.0
+        if angle_delta >= 110.0:
+            return 0.0
+        return float((110.0 - angle_delta) / 90.0)
 
     def _update_animation(self, delta_time, is_moving):
         if self.animated_visual is None:
