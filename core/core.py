@@ -203,8 +203,11 @@ class App(arcade.Window):
             width=size[0],
             height=size[1],
             title=title,
-            update_rate=1 / 60,
-            draw_rate=1 / 60,
+            update_rate=1 / 5000,
+            draw_rate=1 / 5000,
+            fixed_rate=1 / 5000,
+            fixed_frame_cap=None,
+            vsync=False,
             resizable=False,
         )
         self.window_size = size
