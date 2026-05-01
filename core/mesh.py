@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pickle
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -8,6 +9,20 @@ from typing import Optional
 from OpenGL.GL import *
 import numpy, pyrr
 from PIL import Image
+
+
+def get_uniform_location(shader, name):
+    cache = getattr(get_uniform_location, "_cache", None)
+    if cache is None:
+        cache = {}
+        get_uniform_location._cache = cache
+
+    shader_cache = cache.setdefault(shader, {})
+    location = shader_cache.get(name)
+    if location is None:
+        location = glGetUniformLocation(shader, name)
+        shader_cache[name] = location
+    return location
 
 
 class TerrainGridSampler:
@@ -127,6 +142,8 @@ class Mesh:
     PREPARED_CACHE_DIR = Path(".cache") / "obj_prepared"
     PREPARED_SUBMESH_CACHE_DIR = Path(".cache") / "glb_prepared"
     MATERIAL_CACHE_DIR = Path(".cache") / "glb_materials"
+    UNIQUE_POSITIONS_CACHE_DIR = Path(".cache") / "glb_positions"
+    SKINNED_CACHE_DIR = Path(".cache") / "glb_skinned"
 
     def __init__(self, shader, material, position, vertices: Optional[tuple] = None, faces: Optional[tuple] = None, scale=1.0) -> None:
         self.material = material
@@ -140,6 +157,9 @@ class Mesh:
         self.rotation = [0, 0, 0]
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
+        self._bounds_cache = None
+        self._ground_footprint_cache = None
+        self._bounds_cache_key = None
         glUseProgram(self.shader)
         #x, y, z, s, t, nx, ny, nz
         if vertices != None:
@@ -569,6 +589,25 @@ class Mesh:
 
 
     @staticmethod
+    def _get_unique_positions_cache_path(source_path: Path) -> Path:
+        Mesh.UNIQUE_POSITIONS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha1(
+            f"{source_path.resolve()}|unique_positions".encode("utf-8")
+        ).hexdigest()[:12]
+        return Mesh.UNIQUE_POSITIONS_CACHE_DIR / f"{source_path.stem}.{cache_key}.npz"
+
+
+    @staticmethod
+    def _get_skinned_cache_path(source_path: Path, **config) -> Path:
+        Mesh.SKINNED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        config_key = "|".join(f"{key}={config[key]}" for key in sorted(config))
+        cache_key = hashlib.sha1(
+            f"{source_path.resolve()}|skinned|{config_key}".encode("utf-8")
+        ).hexdigest()[:12]
+        return Mesh.SKINNED_CACHE_DIR / f"{source_path.stem}.{cache_key}.pkl"
+
+
+    @staticmethod
     def _load_cached_vertices(cache_file: Path, source_stat):
         if not cache_file.exists():
             return None
@@ -639,6 +678,42 @@ class Mesh:
 
 
     @staticmethod
+    def _load_cached_unique_positions(cache_file: Path, source_stat):
+        if not cache_file.exists():
+            return None
+
+        try:
+            with numpy.load(cache_file, allow_pickle=False) as cache_data:
+                cached_mtime_ns = int(cache_data["mtime_ns"][0])
+                cached_size = int(cache_data["file_size"][0])
+                if cached_mtime_ns != source_stat.st_mtime_ns or cached_size != source_stat.st_size:
+                    return None
+
+                return cache_data["positions"].astype(numpy.float32)
+        except (OSError, KeyError, ValueError):
+            return None
+
+
+    @staticmethod
+    def _load_cached_skinned_data(cache_file: Path, source_stat):
+        if not cache_file.exists():
+            return None
+
+        try:
+            with open(cache_file, "rb") as file:
+                cache_data = pickle.load(file)
+        except (OSError, ValueError, pickle.PickleError):
+            return None
+
+        cached_mtime_ns = int(cache_data.get("mtime_ns", -1))
+        cached_size = int(cache_data.get("file_size", -1))
+        if cached_mtime_ns != source_stat.st_mtime_ns or cached_size != source_stat.st_size:
+            return None
+
+        return cache_data.get("data")
+
+
+    @staticmethod
     def _store_cached_vertices(cache_file: Path, source_stat, vertices):
         numpy.savez_compressed(
             cache_file,
@@ -689,6 +764,30 @@ class Mesh:
             mtime_ns=numpy.array([source_stat.st_mtime_ns], dtype=numpy.int64),
             file_size=numpy.array([source_stat.st_size], dtype=numpy.int64),
         )
+
+
+    @staticmethod
+    def _store_cached_unique_positions(cache_file: Path, source_stat, positions):
+        numpy.savez_compressed(
+            cache_file,
+            positions=numpy.asarray(positions, dtype=numpy.float32),
+            mtime_ns=numpy.array([source_stat.st_mtime_ns], dtype=numpy.int64),
+            file_size=numpy.array([source_stat.st_size], dtype=numpy.int64),
+        )
+
+
+    @staticmethod
+    def _store_cached_skinned_data(cache_file: Path, source_stat, data):
+        with open(cache_file, "wb") as file:
+            pickle.dump(
+                {
+                    "mtime_ns": int(source_stat.st_mtime_ns),
+                    "file_size": int(source_stat.st_size),
+                    "data": data,
+                },
+                file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
 
 
     @staticmethod
@@ -1063,7 +1162,15 @@ class Mesh:
 
     @staticmethod
     def extract_glb_unique_positions(file_name):
-        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        source_path = Path(file_name)
+        cache_file = Mesh._get_unique_positions_cache_path(source_path)
+        source_stat = source_path.stat()
+
+        cached_positions = Mesh._load_cached_unique_positions(cache_file, source_stat)
+        if cached_positions is not None:
+            return cached_positions
+
+        document, binary_chunk = Mesh._read_glb(source_path)
         nodes = document.get("nodes", [])
         scene_index = document.get("scene", 0)
         scenes = document.get("scenes", [])
@@ -1105,7 +1212,9 @@ class Mesh:
         for root_index in root_nodes:
             visit(root_index, identity)
 
-        return list(unique_positions.values())
+        positions = numpy.array(list(unique_positions.values()), dtype=numpy.float32)
+        Mesh._store_cached_unique_positions(cache_file, source_stat, positions)
+        return positions
 
 
     @staticmethod
@@ -1115,7 +1224,21 @@ class Mesh:
         target_size=1.0,
         normalize=True,
     ):
-        document, binary_chunk = Mesh._read_glb(Path(file_name))
+        source_path = Path(file_name)
+        cache_file = Mesh._get_skinned_cache_path(
+            source_path,
+            invert_texcoord=invert_texcoord,
+            target_size=target_size,
+            normalize=normalize,
+        )
+        source_stat = source_path.stat()
+
+        cached_data = Mesh._load_cached_skinned_data(cache_file, source_stat)
+        if cached_data is not None:
+            print(f'cache skinned carregado: {file_name}')
+            return cached_data
+
+        document, binary_chunk = Mesh._read_glb(source_path)
         nodes = document.get("nodes", [])
         node_parents = [-1] * len(nodes)
         root_nodes = Mesh._get_glb_root_nodes(document)
@@ -1216,7 +1339,7 @@ class Mesh:
                 }
             )
 
-        return {
+        result = {
             "submeshes": submeshes,
             "skins": skins,
             "animations": animations,
@@ -1228,6 +1351,8 @@ class Mesh:
                 normalize=normalize,
             ),
         }
+        Mesh._store_cached_skinned_data(cache_file, source_stat, result)
+        return result
 
 
     @staticmethod
@@ -1520,11 +1645,24 @@ class Mesh:
 
 
     def get_world_bounds(self):
+        position = self.position
+        cache_key = (
+            float(position[0]),
+            float(position[1]),
+            float(position[2]),
+            float(self.scale),
+        )
+        if self._bounds_cache_key == cache_key and self._bounds_cache is not None:
+            return self._bounds_cache
+
         minimum, maximum = self.local_bounds
         scaled_min = minimum * self.scale
         scaled_max = maximum * self.scale
-        position = numpy.array(self.position, dtype=numpy.float32)
-        return scaled_min + position, scaled_max + position
+        position_vector = numpy.asarray(position, dtype=numpy.float32)
+        self._bounds_cache_key = cache_key
+        self._bounds_cache = (scaled_min + position_vector, scaled_max + position_vector)
+        self._ground_footprint_cache = None
+        return self._bounds_cache
 
     def set_collider(self, mode="aabb", radius_scale=None, radius_padding=None, height_padding=None):
         self.collider_mode = mode
@@ -1537,13 +1675,17 @@ class Mesh:
         return self
 
     def get_ground_footprint(self):
+        if self._ground_footprint_cache is not None and self._bounds_cache_key is not None:
+            return self._ground_footprint_cache
+
         bounds_min, bounds_max = self.get_world_bounds()
         center_x = float((bounds_min[0] + bounds_max[0]) / 2.0)
         center_y = float((bounds_min[1] + bounds_max[1]) / 2.0)
         half_width = float((bounds_max[0] - bounds_min[0]) / 2.0)
         half_depth = float((bounds_max[1] - bounds_min[1]) / 2.0)
         radius = max(half_width, half_depth) * self.collider_radius_scale + self.collider_radius_padding
-        return center_x, center_y, radius
+        self._ground_footprint_cache = (center_x, center_y, radius)
+        return self._ground_footprint_cache
 
     def collides_with_circle(self, position, radius, probe_z):
         bounds_min, bounds_max = self.get_world_bounds()
@@ -1588,8 +1730,6 @@ class Mesh:
 
     def translate(self, model):
         self.model = self._build_model_matrix(model)
-        glUseProgram(self.shader)
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
 
 
     def rotate_x(self, angle):
@@ -1625,12 +1765,15 @@ class Mesh:
         self.translate(self._compose_rotation_matrix())
 
     def set_rotation(self, x=None, y=None, z=None):
+        new_x = self.rotation[0] if x is None else float(x) % 360
+        new_y = self.rotation[1] if y is None else float(y) % 360
+        new_z = self.rotation[2] if z is None else float(z) % 360
         if x is not None:
-            self.rotation[0] = float(x) % 360
+            self.rotation[0] = new_x
         if y is not None:
-            self.rotation[1] = float(y) % 360
+            self.rotation[1] = new_y
         if z is not None:
-            self.rotation[2] = float(z) % 360
+            self.rotation[2] = new_z
         self.translate(self._compose_rotation_matrix())
 
 
@@ -1639,7 +1782,7 @@ class Mesh:
         self.material.use()
         if type(self.model) == type(None):
             self.model = self._build_model_matrix(self.identity)
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(get_uniform_location(self.shader, "model"), 1, GL_FALSE, self.model)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
     
@@ -1661,6 +1804,8 @@ class SkinnedAnimator:
         self.current_time = 0.0
         self.loop = True
         self.paused = False
+        self.revision = 0
+        self._skin_matrix_cache = {}
         self.world_matrices = self._compute_world_matrices()
 
     def has_animation(self, name):
@@ -1682,30 +1827,44 @@ class SkinnedAnimator:
             self.current_time = float(hold_time)
 
         self.world_matrices = self._compute_world_matrices()
+        self._skin_matrix_cache.clear()
+        self.revision += 1
         return True
 
     def update(self, delta_time):
+        world_changed = False
         if self.current_animation is not None and not self.paused:
             duration = float(self.current_animation["duration"])
             if duration > 0.0:
+                previous_time = self.current_time
                 self.current_time += float(delta_time)
                 if self.loop:
                     self.current_time %= duration
                 else:
                     self.current_time = min(self.current_time, duration)
+                world_changed = abs(self.current_time - previous_time) > 1e-8
 
-        self.world_matrices = self._compute_world_matrices()
+        if world_changed:
+            self.world_matrices = self._compute_world_matrices()
+            self._skin_matrix_cache.clear()
+            self.revision += 1
 
     def get_skin_matrices(self, skin_index, mesh_bind_matrix, mode="standard"):
         if skin_index is None or skin_index < 0 or skin_index >= len(self.skins):
             return numpy.identity(4, dtype=numpy.float32).reshape((1, 4, 4))
+
+        cached = self._skin_matrix_cache.get(skin_index)
+        if cached is not None:
+            return cached
 
         skin = self.skins[skin_index]
         joint_matrices = []
         for joint_node_index, inverse_bind_matrix in zip(skin["joints"], skin["inverse_bind_matrices"]):
             joint_world = self.world_matrices[joint_node_index]
             joint_matrices.append(numpy.matmul(joint_world, inverse_bind_matrix))
-        return numpy.array(joint_matrices, dtype=numpy.float32)
+        result = numpy.array(joint_matrices, dtype=numpy.float32)
+        self._skin_matrix_cache[skin_index] = result
+        return result
 
     def _compute_world_matrices(self):
         local_matrices = []
@@ -1729,9 +1888,9 @@ class SkinnedAnimator:
             local_matrices.append(
                 Mesh._glb_node_matrix_cpu(
                     {
-                        "translation": translation.tolist(),
-                        "rotation": rotation.tolist(),
-                        "scale": scale.tolist(),
+                        "translation": translation,
+                        "rotation": rotation,
+                        "scale": scale,
                     }
                 )
             )
@@ -1846,6 +2005,7 @@ class SkinnedMesh(Mesh):
         self.vertex_count = len(self.base_vertices)
         self.vertices = numpy.array(vertices, dtype=numpy.float32).reshape(-1, self.base_vertex_size)
         self.bone_matrices = self._compute_bone_matrices()
+        self._last_animator_revision = self.animator.revision
         self.local_bounds = self._compute_bind_local_bounds()
         self.local_bounds = (
             self.local_bounds[0] + self.origin_offset,
@@ -1885,23 +2045,23 @@ class SkinnedMesh(Mesh):
         if self.model is None:
             self.model = self._build_model_matrix(self.identity)
 
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(get_uniform_location(self.shader, "model"), 1, GL_FALSE, self.model)
         glUniformMatrix4fv(
-            glGetUniformLocation(self.shader, "meshBindMatrix"),
+            get_uniform_location(self.shader, "meshBindMatrix"),
             1,
             GL_FALSE,
             numpy.ascontiguousarray(self.mesh_bind_matrix.T, dtype=numpy.float32),
         )
         glUniformMatrix4fv(
-            glGetUniformLocation(self.shader, "postSkinningTransform"),
+            get_uniform_location(self.shader, "postSkinningTransform"),
             1,
             GL_FALSE,
             numpy.ascontiguousarray(self.post_skinning_transform.T, dtype=numpy.float32),
         )
-        glUniform1i(glGetUniformLocation(self.shader, "boneCount"), int(len(self.bone_matrices)))
+        glUniform1i(get_uniform_location(self.shader, "boneCount"), int(len(self.bone_matrices)))
         if len(self.bone_matrices) > 0:
             glUniformMatrix4fv(
-                glGetUniformLocation(self.shader, "boneMatrices"),
+                get_uniform_location(self.shader, "boneMatrices"),
                 len(self.bone_matrices),
                 GL_FALSE,
                 numpy.ascontiguousarray(self.bone_matrices.transpose((0, 2, 1)), dtype=numpy.float32),
@@ -1924,7 +2084,10 @@ class SkinnedMesh(Mesh):
         return positions.min(axis=0), positions.max(axis=0)
 
     def update_skinning(self):
+        if self._last_animator_revision == self.animator.revision:
+            return
         self.bone_matrices = self._compute_bone_matrices()
+        self._last_animator_revision = self.animator.revision
 
     def _compute_bone_matrices(self):
         bone_matrices = self.animator.get_skin_matrices(
@@ -2146,7 +2309,7 @@ class MeshRGB:
             translation_matrix = pyrr.matrix44.create_from_translation(vec=position, dtype=numpy.float32)
             self.model = pyrr.matrix44.multiply(scale_matrix, translation_matrix)
 
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "model"), 1, GL_FALSE, self.model)
+        glUniformMatrix4fv(get_uniform_location(self.shader, "model"), 1, GL_FALSE, self.model)
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
     

@@ -3,6 +3,8 @@ import numpy
 
 from core.core import CameraFirstPerson, CameraThirdPerson
 
+DIAGONAL_NORMALIZER = numpy.float32(0.70710677)
+
 
 class PlayerController:
     def __init__(
@@ -27,6 +29,12 @@ class PlayerController:
         self.radius = 0.4
         self.eye_height = 1.7
         self.ground_height = 0.0
+        self._key_w = arcade.key.W
+        self._key_a = arcade.key.A
+        self._key_s = arcade.key.S
+        self._key_d = arcade.key.D
+        self._key_lshift = arcade.key.LSHIFT
+        self._key_rshift = arcade.key.RSHIFT
 
     def on_key_press(self, symbol):
         self.keys_down.add(symbol)
@@ -91,13 +99,13 @@ class PlayerFirstPerson(PlayerController):
         self.camera.position[2] = self.ground_height + self.eye_height
 
     def update(self, delta_time):
-        if arcade.key.W in self.keys_down:
+        if self._key_w in self.keys_down:
             self.move(0, self.speed * delta_time)
-        if arcade.key.A in self.keys_down:
+        if self._key_a in self.keys_down:
             self.move(90, self.speed * delta_time)
-        if arcade.key.S in self.keys_down:
+        if self._key_s in self.keys_down:
             self.move(180, self.speed * delta_time)
-        if arcade.key.D in self.keys_down:
+        if self._key_d in self.keys_down:
             self.move(-90, self.speed * delta_time)
 
         self.ground_height = self._sample_ground_height(self.camera.position[0], self.camera.position[1])
@@ -173,14 +181,14 @@ class PlayerThirdPerson(PlayerController):
         self._sync_visuals()
 
     def update(self, delta_time):
-        move_vector = self._get_move_vector()
-        is_moving = numpy.linalg.norm(move_vector[:2]) > 1e-6
+        move_x, move_y, is_moving = self._get_move_vector()
         is_running = is_moving and self._is_run_pressed()
         self.speed = self.run_speed if is_running else self.walk_speed
         self._update_facing(delta_time)
         if is_moving:
             move_scale = self._get_turn_movement_factor()
-            self._move(move_vector * self.speed * delta_time * move_scale)
+            move_amount = self.speed * float(delta_time) * move_scale
+            self._move(move_x * move_amount, move_y * move_amount)
         self._update_animation(delta_time, is_moving, is_running)
 
         self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
@@ -190,53 +198,48 @@ class PlayerThirdPerson(PlayerController):
         self.camera.update(self.shaders)
 
     def _get_move_vector(self):
-        input_x = 0.0
-        input_y = 0.0
-        if arcade.key.D in self.keys_down:
-            input_x += 1.0
-        if arcade.key.A in self.keys_down:
-            input_x -= 1.0
-        if arcade.key.W in self.keys_down:
-            input_y += 1.0
-        if arcade.key.S in self.keys_down:
-            input_y -= 1.0
+        input_x = float((self._key_d in self.keys_down) - (self._key_a in self.keys_down))
+        input_y = float((self._key_w in self.keys_down) - (self._key_s in self.keys_down))
 
         if input_x == 0.0 and input_y == 0.0:
-            return numpy.zeros(3, dtype=numpy.float32)
+            return 0.0, 0.0, False
 
-        movement = numpy.array([input_x, input_y], dtype=numpy.float32)
-        movement /= max(float(numpy.linalg.norm(movement)), 1e-6)
+        if input_x != 0.0 and input_y != 0.0:
+            input_x *= DIAGONAL_NORMALIZER
+            input_y *= DIAGONAL_NORMALIZER
 
         # Character facing is derived directly from camera heading plus input direction.
         # This keeps W aligned with the current camera forward.
-        input_angle = numpy.degrees(numpy.arctan2(-movement[0], movement[1]))
+        input_angle = numpy.degrees(numpy.arctan2(-input_x, input_y))
         self.target_facing_yaw = float((self.camera.theta + input_angle) % 360.0)
 
         camera_theta = numpy.radians(self.camera.theta)
-        camera_forward = numpy.array(
-            [numpy.cos(camera_theta, dtype=numpy.float32), numpy.sin(camera_theta, dtype=numpy.float32)],
-            dtype=numpy.float32,
-        )
-        camera_right = numpy.array([camera_forward[1], -camera_forward[0]], dtype=numpy.float32)
-        world_direction = camera_forward * movement[1] + camera_right * movement[0]
-        world_direction /= max(float(numpy.linalg.norm(world_direction)), 1e-6)
-        return numpy.array([world_direction[0], world_direction[1], 0.0], dtype=numpy.float32)
+        camera_cos = float(numpy.cos(camera_theta, dtype=numpy.float32))
+        camera_sin = float(numpy.sin(camera_theta, dtype=numpy.float32))
+        world_x = (camera_cos * input_y) + (camera_sin * input_x)
+        world_y = (camera_sin * input_y) - (camera_cos * input_x)
+        return world_x, world_y, True
 
-    def _move(self, movement):
-        current_position = self.position.copy()
+    def _move(self, delta_x, delta_y):
+        current_x = float(self.position[0])
+        current_y = float(self.position[1])
 
-        next_position = current_position.copy()
-        next_position[0] += movement[0]
-        if not self._is_blocked(next_position, self.character_height):
-            current_position[0] = next_position[0]
+        if delta_x != 0.0:
+            next_position = self.position.copy()
+            next_position[0] = current_x + delta_x
+            if not self._is_blocked(next_position, self.character_height):
+                current_x = float(next_position[0])
 
-        next_position = current_position.copy()
-        next_position[1] += movement[1]
-        if not self._is_blocked(next_position, self.character_height):
-            current_position[1] = next_position[1]
+        if delta_y != 0.0:
+            next_position = self.position.copy()
+            next_position[0] = current_x
+            next_position[1] = current_y + delta_y
+            if not self._is_blocked(next_position, self.character_height):
+                current_y = float(next_position[1])
 
-        current_position[2] = self._sample_ground_height(current_position[0], current_position[1])
-        self.position = current_position
+        self.position[0] = current_x
+        self.position[1] = current_y
+        self.position[2] = self._sample_ground_height(current_x, current_y)
 
     def _update_facing(self, delta_time):
         angle_delta = ((self.target_facing_yaw - self.facing_yaw + 180.0) % 360.0) - 180.0
@@ -255,7 +258,7 @@ class PlayerThirdPerson(PlayerController):
         return float((110.0 - angle_delta) / 90.0)
 
     def _is_run_pressed(self):
-        return arcade.key.LSHIFT in self.keys_down or arcade.key.RSHIFT in self.keys_down
+        return self._key_lshift in self.keys_down or self._key_rshift in self.keys_down
 
     def _update_animation(self, delta_time, is_moving, is_running):
         if self.animated_visual is None:

@@ -1,5 +1,6 @@
 import os
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import arcade
 import numpy
@@ -19,6 +20,71 @@ PLAYER_TARGET_SIZE = 1.9
 PLAYER_NORMALIZE = True
 PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
+SCENE_GLB_FILES = (
+    ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
+    ("break_time.glb", [12, 12, 0], 1.8, 0.44, 0.1),
+)
+
+
+def _preload_static_glb_asset(file_path, target_size, normalize, rotation_degrees=(0.0, 0.0, 0.0), include_positions=False):
+    if include_positions:
+        Mesh.extract_glb_unique_positions(file_path)
+
+    submeshes = Mesh.load_glb_submeshes_prepared(
+        file_path,
+        invert_texcoord=False,
+        st_pos=4,
+        vertex_size=8,
+        target_size=target_size,
+        normalize=normalize,
+        rotation_degrees=rotation_degrees,
+    )
+    material_indices = sorted(
+        {
+            int(submesh["material_index"])
+            for submesh in submeshes
+            if int(submesh["material_index"]) >= 0
+        }
+    )
+    for material_index in material_indices:
+        Mesh.load_glb_material_images(file_path, material_index=material_index)
+    return file_path
+
+
+def _preload_player_asset(file_path, target_size, normalize, render_mode):
+    material_indices = set()
+
+    static_submeshes = Mesh.load_glb_submeshes_prepared(
+        file_path,
+        invert_texcoord=False,
+        st_pos=4,
+        vertex_size=8,
+        target_size=target_size,
+        normalize=normalize,
+        rotation_degrees=(0.0, 0.0, 0.0),
+    )
+    material_indices.update(
+        int(submesh["material_index"])
+        for submesh in static_submeshes
+        if int(submesh["material_index"]) >= 0
+    )
+
+    if render_mode != "static":
+        skinned_data = Mesh.load_glb_skinned_data(
+            file_path,
+            invert_texcoord=False,
+            target_size=target_size,
+            normalize=normalize,
+        )
+        material_indices.update(
+            int(submesh["material_index"])
+            for submesh in skinned_data["submeshes"]
+            if int(submesh["material_index"]) >= 0
+        )
+
+    for material_index in sorted(material_indices):
+        Mesh.load_glb_material_images(file_path, material_index=material_index)
+    return file_path
 
 
 class GameWindow(App):
@@ -32,11 +98,15 @@ class GameWindow(App):
         self.set_exclusive_mouse(True)
         self.cleaned_up = False
         self.player_fallback_submeshes = []
+        self._glb_material_cache = {}
+        self._owned_materials = []
+        self._scene_draw_meshes = []
         self._setup_scene()
 
     def _setup_scene(self):
         self.terrain_origin = numpy.array([10.0, 4.0, -0.02], dtype=numpy.float32)
         self.terrain_glb_path = os.path.join("obj", "terrain_main.glb")
+        self._preload_scene_assets_parallel()
         self.terrain_sampler = TerrainGridSampler.from_glb(self.terrain_glb_path)
         self.terrain_height = lambda world_x, world_y: self.terrain_sampler.sample_height(
             world_x - self.terrain_origin[0],
@@ -73,6 +143,9 @@ class GameWindow(App):
                 [True, False, True],
             ),
         ]
+        self.dynamic_lights = [light for light in self.light if light.dynamic]
+        for light in self.light:
+            light.update()
 
         self.lampada = [
             MeshRGB(self.shaders[1], self.light[1], color=[1, 0.95, 0.8]),
@@ -108,13 +181,9 @@ class GameWindow(App):
         )
         self.terrain = self._get_primary_mesh(self.terrain_meshes)
 
-        glb_scene = [
-            ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
-            ("break_time.glb", [12, 12, 0], 1.8, 0.44, 0.1),
-        ]
         self.scene_meshes = []
         self.scene_materials = []
-        for file_name, position, target_size, collider_radius_scale, collider_radius_padding in glb_scene:
+        for file_name, position, target_size, collider_radius_scale, collider_radius_padding in SCENE_GLB_FILES:
             grounded_position = [position[0], position[1], self.terrain_height(position[0], position[1])]
             model_meshes, model_materials = self._build_glb_model(
                 os.path.join("obj", file_name),
@@ -132,6 +201,7 @@ class GameWindow(App):
                 height_padding=0.1,
             )
             self.scene_meshes.append(primary_mesh)
+            self._scene_draw_meshes.extend([primary_mesh, *primary_mesh.extra_meshes])
 
         self.cubes = [
             Mesh(
@@ -181,6 +251,37 @@ class GameWindow(App):
         )
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
 
+    def _preload_scene_assets_parallel(self):
+        cpu_count = os.cpu_count() or 1
+        if cpu_count < 2:
+            return
+
+        preload_jobs = [
+            (_preload_static_glb_asset, (self.terrain_glb_path, 52.0, False, (0.0, 0.0, 0.0), True)),
+        ]
+        preload_jobs.extend(
+            (
+                _preload_static_glb_asset,
+                (os.path.join("obj", file_name), target_size, True, (0.0, 0.0, 0.0), False),
+            )
+            for file_name, _position, target_size, _radius_scale, _radius_padding in SCENE_GLB_FILES
+        )
+        preload_jobs.append(
+            (
+                _preload_player_asset,
+                (os.path.join("obj", "Player.glb"), PLAYER_TARGET_SIZE, PLAYER_NORMALIZE, PLAYER_RENDER_MODE),
+            )
+        )
+
+        max_workers = min(len(preload_jobs), cpu_count)
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(job, *args) for job, args in preload_jobs]
+                for future in as_completed(futures):
+                    future.result()
+        except Exception as exc:
+            print(f"Preload paralelo desativado, seguindo em modo normal: {exc}")
+
     def _build_glb_model(self, file_path, position, target_size, normalize=True, rotation_degrees=(0.0, 0.0, 0.0)):
         submeshes = Mesh.load_glb_submeshes_prepared(
             file_path,
@@ -194,19 +295,16 @@ class GameWindow(App):
         material_cache = {}
         materials = []
         meshes = []
+        position_vector = numpy.array(position, dtype=numpy.float32)
         for submesh in submeshes:
             material_index = submesh["material_index"]
             material = material_cache.get(material_index)
             if material is None:
-                if material_index >= 0:
-                    material_images = Mesh.load_glb_material_images(file_path, material_index=material_index)
-                    material = Material.from_compatible_glb_images(material_images)
-                else:
-                    material = self.ground_texture
+                material = self._get_glb_material(file_path, material_index)
                 material_cache[material_index] = material
                 if material is not self.ground_texture:
                     materials.append(material)
-            meshes.append(Mesh(self.shaders[0], material, numpy.array(position, dtype=numpy.float32).copy(), submesh["vertices"]))
+            meshes.append(Mesh(self.shaders[0], material, position_vector.copy(), submesh["vertices"]))
         return meshes, materials
 
     def _get_primary_mesh(self, meshes):
@@ -271,16 +369,12 @@ class GameWindow(App):
         material_cache = {}
         materials = []
         meshes = []
-        model_transform = model_data["transform"]
+        position_vector = numpy.array(position, dtype=numpy.float32)
         for submesh in model_data["submeshes"]:
             material_index = submesh["material_index"]
             material = material_cache.get(material_index)
             if material is None:
-                if material_index >= 0:
-                    material_images = Mesh.load_glb_material_images(file_path, material_index=material_index)
-                    material = Material.from_compatible_glb_images(material_images)
-                else:
-                    material = self.ground_texture
+                material = self._get_glb_material(file_path, material_index)
                 material_cache[material_index] = material
                 if material is not self.ground_texture:
                     materials.append(material)
@@ -296,7 +390,7 @@ class GameWindow(App):
             mesh = SkinnedMesh(
                 self.shaders[2],
                 material,
-                numpy.array(position, dtype=numpy.float32).copy(),
+                position_vector.copy(),
                 submesh["vertices"],
                 animator,
                 submesh["skin_index"],
@@ -319,7 +413,7 @@ class GameWindow(App):
                     mesh = Mesh(
                         self.shaders[0],
                         material,
-                        numpy.array(position, dtype=numpy.float32).copy(),
+                        position_vector.copy(),
                         static_submesh["vertices"],
                     )
             meshes.append(mesh)
@@ -335,6 +429,21 @@ class GameWindow(App):
             print("Player skinned sem fallback de submalha.")
 
         return SkinnedModel(meshes, materials, animator)
+
+    def _get_glb_material(self, file_path, material_index):
+        if material_index < 0:
+            return self.ground_texture
+
+        cache_key = (file_path, int(material_index))
+        material = self._glb_material_cache.get(cache_key)
+        if material is not None:
+            return material
+
+        material_images = Mesh.load_glb_material_images(file_path, material_index=material_index)
+        material = Material.from_compatible_glb_images(material_images)
+        self._glb_material_cache[cache_key] = material
+        self._owned_materials.append(material)
+        return material
 
     def _skinned_mesh_needs_static_fallback(self, skinned_mesh, static_vertices, max_allowed_diff=0.45):
         static_positions = numpy.array(static_vertices, dtype=numpy.float32).reshape(-1, 11)[:, :3]
@@ -397,17 +506,22 @@ class GameWindow(App):
             return
 
         self.cleaned_up = True
-        [glDeleteProgram(shader) for shader in self.shaders]
+        for shader in self.shaders:
+            glDeleteProgram(shader)
         self.crate_texture.destroy()
         self.ground_texture.destroy()
-        [material.destroy() for material in self.terrain_materials]
-        [material.destroy() for material in self.player_materials]
-        [material.destroy() for material in self.scene_materials]
-        [mesh.destroy() for mesh in self.terrain_meshes]
-        [mesh.destroy() for mesh in self.player_meshes]
-        [mesh.destroy() for primary in self.scene_meshes for mesh in [primary, *getattr(primary, "extra_meshes", [])]]
-        [x.destroy() for x in self.cubes]
-        [x.destroy() for x in self.lampada]
+        for material in self._owned_materials:
+            material.destroy()
+        for mesh in self.terrain_meshes:
+            mesh.destroy()
+        for mesh in self.player_meshes:
+            mesh.destroy()
+        for mesh in self._scene_draw_meshes:
+            mesh.destroy()
+        for cube in self.cubes:
+            cube.destroy()
+        for lamp in self.lampada:
+            lamp.destroy()
         self.sky.destroy()
 
     def on_draw(self):
@@ -416,18 +530,20 @@ class GameWindow(App):
         glDepthMask(GL_FALSE)
         self.sky.draw()
         glDepthMask(GL_TRUE)
-        [mesh.draw() for mesh in self.terrain_meshes]
-        [mesh.draw() for mesh in self.player_meshes]
-        [x.draw() for x in self.cubes]
-        [
+        for mesh in self.terrain_meshes:
             mesh.draw()
-            for primary in self.scene_meshes
-            for mesh in [primary, *getattr(primary, "extra_meshes", [])]
-        ]
-        [x.draw() for x in self.lampada]
+        for mesh in self.player_meshes:
+            mesh.draw()
+        for cube in self.cubes:
+            cube.draw()
+        for mesh in self._scene_draw_meshes:
+            mesh.draw()
+        for lamp in self.lampada:
+            lamp.draw()
 
     def on_update(self, delta_time):
-        [x.update() for x in self.light]
+        for light in self.dynamic_lights:
+            light.update()
         self.player.update(delta_time)
 
         fps = 0 if delta_time <= 0 else round(1 / delta_time, 0)

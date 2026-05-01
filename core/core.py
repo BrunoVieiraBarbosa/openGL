@@ -10,6 +10,20 @@ from OpenGL.GL.shaders import compileProgram, compileShader
 from core.light import Light
 
 
+def get_uniform_location(shader, name):
+    cache = getattr(get_uniform_location, "_cache", None)
+    if cache is None:
+        cache = {}
+        get_uniform_location._cache = cache
+
+    shader_cache = cache.setdefault(shader, {})
+    location = shader_cache.get(name)
+    if location is None:
+        location = glGetUniformLocation(shader, name)
+        shader_cache[name] = location
+    return location
+
+
 class Shader:
     @staticmethod
     def create_shader(vertex_file_path, fragment_file_path):
@@ -106,9 +120,21 @@ class Camera:
         self.forward = numpy.array([0, 0, 0], dtype=numpy.float32)
         self.move_speed = 1
         self.global_up = numpy.array([0, 0, 1], dtype=numpy.float32)
+        self._last_view_signature = None
 
     def apply_view(self, shaders, target):
         target = numpy.array(target, dtype=numpy.float32)
+        view_signature = (
+            float(self.position[0]),
+            float(self.position[1]),
+            float(self.position[2]),
+            float(target[0]),
+            float(target[1]),
+            float(target[2]),
+        )
+        if self._last_view_signature == view_signature:
+            return
+        self._last_view_signature = view_signature
         self.forward = target - self.position
         forward_norm = max(float(numpy.linalg.norm(self.forward)), 1e-6)
         self.forward /= forward_norm
@@ -125,8 +151,13 @@ class Camera:
 
         for shader in shaders:
             glUseProgram(shader)
-            glUniformMatrix4fv(glGetUniformLocation(shader, "view"), 1, GL_FALSE, look_at_matrix)
-            glUniform3fv(glGetUniformLocation(shader, "cameraPos"), 1, self.position)
+            view_location = get_uniform_location(shader, "view")
+            if view_location >= 0:
+                glUniformMatrix4fv(view_location, 1, GL_FALSE, look_at_matrix)
+
+            camera_location = get_uniform_location(shader, "cameraPos")
+            if camera_location >= 0:
+                glUniform3fv(camera_location, 1, self.position)
 
 
 class CameraFirstPerson(Camera):
@@ -233,7 +264,7 @@ class App(arcade.Window):
 
         for shader in self.shaders:
             glUseProgram(shader)
-            location = glGetUniformLocation(shader, "projection")
+            location = get_uniform_location(shader, "projection")
             if location >= 0:
                 glUniformMatrix4fv(location, 1, GL_FALSE, projection_transform)
 
@@ -241,7 +272,7 @@ class App(arcade.Window):
         for shader in self.shaders:
             glUseProgram(shader)
 
-            ambient_location = glGetUniformLocation(shader, "ambient")
+            ambient_location = get_uniform_location(shader, "ambient")
             if ambient_location >= 0:
                 glUniform3fv(
                     ambient_location,
@@ -249,27 +280,27 @@ class App(arcade.Window):
                     numpy.array(self.ambient_color[:3], dtype=numpy.float32),
                 )
 
-            fog_color_location = glGetUniformLocation(shader, "fogColor")
+            fog_color_location = get_uniform_location(shader, "fogColor")
             if fog_color_location >= 0:
                 glUniform3fv(fog_color_location, 1, self.fog_color)
 
-            fog_near_location = glGetUniformLocation(shader, "fogNear")
+            fog_near_location = get_uniform_location(shader, "fogNear")
             if fog_near_location >= 0:
                 glUniform1f(fog_near_location, self.fog_near)
 
-            fog_far_location = glGetUniformLocation(shader, "fogFar")
+            fog_far_location = get_uniform_location(shader, "fogFar")
             if fog_far_location >= 0:
                 glUniform1f(fog_far_location, self.fog_far)
 
-            diffuse_location = glGetUniformLocation(shader, "material.diffuse")
+            diffuse_location = get_uniform_location(shader, "material.diffuse")
             if diffuse_location >= 0:
                 glUniform1i(diffuse_location, 0)
 
-            specular_location = glGetUniformLocation(shader, "material.specular")
+            specular_location = get_uniform_location(shader, "material.specular")
             if specular_location >= 0:
                 glUniform1i(specular_location, 1)
 
-            normal_location = glGetUniformLocation(shader, "material.normal")
+            normal_location = get_uniform_location(shader, "material.normal")
             if normal_location >= 0:
                 glUniform1i(normal_location, 2)
 
