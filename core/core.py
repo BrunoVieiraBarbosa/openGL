@@ -203,29 +203,33 @@ class CameraThirdPerson(Camera):
         self.min_distance = 2.4
         self.min_phi = -55
         self.max_phi = 20
+        self._target = numpy.array(focus_position, dtype=numpy.float32)
 
     def increment_direction(self, horizontal, vertical):
         self.theta = (self.theta + horizontal) % 360
         self.phi = min(max(self.phi + vertical, self.min_phi), self.max_phi)
 
     def update_focus(self, focus_position):
-        self.focus_position = numpy.array(focus_position, dtype=numpy.float32)
+        self.focus_position[0] = focus_position[0]
+        self.focus_position[1] = focus_position[1]
+        self.focus_position[2] = focus_position[2]
 
     def update(self, shaders):
         theta = numpy.radians(self.theta)
         phi = numpy.radians(self.phi)
-        orbit_forward = numpy.array(
-            [
-                numpy.cos(theta, dtype=numpy.float32) * numpy.cos(phi, dtype=numpy.float32),
-                numpy.sin(theta, dtype=numpy.float32) * numpy.cos(phi, dtype=numpy.float32),
-                numpy.sin(phi, dtype=numpy.float32),
-            ],
-            dtype=numpy.float32,
-        )
-        target = self.focus_position + numpy.array([0.0, 0.0, self.height], dtype=numpy.float32)
-        desired_position = target - orbit_forward * self.distance
-        self.position = desired_position.astype(numpy.float32)
-        self.apply_view(shaders, target)
+        cos_theta = numpy.cos(theta, dtype=numpy.float32)
+        sin_theta = numpy.sin(theta, dtype=numpy.float32)
+        cos_phi = numpy.cos(phi, dtype=numpy.float32)
+        sin_phi = numpy.sin(phi, dtype=numpy.float32)
+
+        self._target[0] = self.focus_position[0]
+        self._target[1] = self.focus_position[1]
+        self._target[2] = self.focus_position[2] + self.height
+
+        self.position[0] = self._target[0] - (cos_theta * cos_phi * self.distance)
+        self.position[1] = self._target[1] - (sin_theta * cos_phi * self.distance)
+        self.position[2] = self._target[2] - (sin_phi * self.distance)
+        self.apply_view(shaders, self._target)
 
 
 class App(arcade.Window):

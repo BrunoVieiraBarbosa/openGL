@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import arcade
 import numpy
 
@@ -16,6 +18,7 @@ class PlayerController:
         ground_height_fn=None,
         terrain_contains_fn=None,
         always_play_walk=False,
+        profiler=None,
     ) -> None:
         self.camera = camera
         self.shaders = shaders
@@ -29,6 +32,7 @@ class PlayerController:
         self.radius = 0.4
         self.eye_height = 1.7
         self.ground_height = 0.0
+        self.profiler = profiler
         self._key_w = arcade.key.W
         self._key_a = arcade.key.A
         self._key_s = arcade.key.S
@@ -73,6 +77,11 @@ class PlayerController:
 
         return False
 
+    def _profile_section(self, name):
+        if self.profiler is None:
+            return nullcontext()
+        return self.profiler.section(name)
+
 
 class PlayerFirstPerson(PlayerController):
     def __init__(
@@ -84,6 +93,7 @@ class PlayerFirstPerson(PlayerController):
         ground_height_fn=None,
         terrain_contains_fn=None,
         always_play_walk=False,
+        profiler=None,
     ) -> None:
         super().__init__(
             camera,
@@ -92,6 +102,7 @@ class PlayerFirstPerson(PlayerController):
             terrain_bounds=terrain_bounds,
             ground_height_fn=ground_height_fn,
             terrain_contains_fn=terrain_contains_fn,
+            profiler=profiler,
         )
         self.speed = 6.0
         self.radius = 0.4
@@ -149,6 +160,7 @@ class PlayerThirdPerson(PlayerController):
         ground_height_fn=None,
         terrain_contains_fn=None,
         always_play_walk=False,
+        profiler=None,
     ) -> None:
         super().__init__(
             camera,
@@ -157,6 +169,7 @@ class PlayerThirdPerson(PlayerController):
             terrain_bounds=terrain_bounds,
             ground_height_fn=ground_height_fn,
             terrain_contains_fn=terrain_contains_fn,
+            profiler=profiler,
         )
         self.player_mesh = player_mesh
         self.visual_meshes = visual_meshes or [player_mesh]
@@ -177,25 +190,41 @@ class PlayerThirdPerson(PlayerController):
         self.turn_speed = 220.0
         self.last_world_direction = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
         self.active_animation_state = None
+        self._has_walk_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("walk"))
+        self._has_run_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("run"))
+        self._has_idle_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("idle"))
+        self._last_visual_signature = None
         self.camera.update_focus(self.position)
         self._sync_visuals()
 
     def update(self, delta_time):
-        move_x, move_y, is_moving = self._get_move_vector()
-        is_running = is_moving and self._is_run_pressed()
-        self.speed = self.run_speed if is_running else self.walk_speed
-        self._update_facing(delta_time)
-        if is_moving:
-            move_scale = self._get_turn_movement_factor()
-            move_amount = self.speed * float(delta_time) * move_scale
-            self._move(move_x * move_amount, move_y * move_amount)
-        self._update_animation(delta_time, is_moving, is_running)
+        with self._profile_section("player.input"):
+            move_x, move_y, is_moving = self._get_move_vector()
+            is_running = is_moving and self._is_run_pressed()
+            self.speed = self.run_speed if is_running else self.walk_speed
 
-        self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
-        self.position[2] = self.ground_height
-        self._sync_visuals()
-        self.camera.update_focus(self.position)
-        self.camera.update(self.shaders)
+        with self._profile_section("player.facing"):
+            self._update_facing(delta_time)
+
+        with self._profile_section("player.move"):
+            if is_moving:
+                move_scale = self._get_turn_movement_factor()
+                move_amount = self.speed * float(delta_time) * move_scale
+                self._move(move_x * move_amount, move_y * move_amount)
+
+        with self._profile_section("player.animation"):
+            self._update_animation(delta_time, is_moving, is_running)
+
+        with self._profile_section("player.ground_sync"):
+            self.ground_height = self._sample_ground_height(self.position[0], self.position[1])
+            self.position[2] = self.ground_height
+
+        with self._profile_section("player.visual_sync"):
+            self._sync_visuals()
+
+        with self._profile_section("player.camera"):
+            self.camera.update_focus(self.position)
+            self.camera.update(self.shaders)
 
     def _get_move_vector(self):
         input_x = float((self._key_d in self.keys_down) - (self._key_a in self.keys_down))
@@ -264,61 +293,67 @@ class PlayerThirdPerson(PlayerController):
         if self.animated_visual is None:
             return
 
-        has_walk = self.animated_visual.has_animation("walk")
-        has_run = self.animated_visual.has_animation("run")
-        has_idle = self.animated_visual.has_animation("idle")
-        if not has_walk and not has_run and not has_idle:
+        if not self._has_walk_animation and not self._has_run_animation and not self._has_idle_animation:
             return
 
         target_state = "run" if is_running else ("walk" if (is_moving or self.always_play_walk) else "idle")
-        if target_state == "run" and not has_run:
+        if target_state == "run" and not self._has_run_animation:
             target_state = "walk"
-        if target_state == "walk" and not has_walk:
+        if target_state == "walk" and not self._has_walk_animation:
             target_state = "idle"
 
-        if target_state == "idle":
-            if has_idle:
-                self.animated_visual.play(
-                    "idle",
-                    loop=True,
-                    paused=False,
-                    restart=self.active_animation_state != "idle",
-                )
-            elif has_walk:
+        if target_state != self.active_animation_state:
+            if target_state == "idle":
+                if self._has_idle_animation:
+                    self.animated_visual.play(
+                        "idle",
+                        loop=True,
+                        paused=False,
+                        restart=True,
+                    )
+                elif self._has_walk_animation:
+                    self.animated_visual.play(
+                        "walk",
+                        loop=True,
+                        paused=True,
+                        restart=True,
+                        hold_time=0.0,
+                    )
+            elif target_state == "walk":
                 self.animated_visual.play(
                     "walk",
                     loop=True,
-                    paused=True,
-                    restart=self.active_animation_state != "idle",
-                    hold_time=0.0,
+                    paused=False,
+                    restart=True,
                 )
-        elif target_state == "walk":
-            self.animated_visual.play(
-                "walk",
-                loop=True,
-                paused=False,
-                restart=self.active_animation_state != "walk",
-            )
-        elif target_state == "run":
-            self.animated_visual.play(
-                "run",
-                loop=True,
-                paused=False,
-                restart=self.active_animation_state != "run",
-            )
+            elif target_state == "run":
+                self.animated_visual.play(
+                    "run",
+                    loop=True,
+                    paused=False,
+                    restart=True,
+                )
+            self.active_animation_state = target_state
 
-        self.active_animation_state = target_state
         self.animated_visual.update(delta_time)
 
     def _sync_visuals(self):
-        mesh_position = self.position + self.mesh_position_offset
+        mesh_x = float(self.position[0] + self.mesh_position_offset[0])
+        mesh_y = float(self.position[1] + self.mesh_position_offset[1])
+        mesh_z = float(self.position[2] + self.mesh_position_offset[2])
         rotation_x, rotation_y, rotation_z = self.mesh_rotation_offset
+        final_rotation_z = rotation_z - self.facing_yaw + self.mesh_heading_offset
+        visual_signature = (mesh_x, mesh_y, mesh_z, float(rotation_x), float(rotation_y), float(final_rotation_z))
+        if self._last_visual_signature == visual_signature:
+            return
+
+        self._last_visual_signature = visual_signature
         for mesh in self.visual_meshes:
-            mesh.position[0] = float(mesh_position[0])
-            mesh.position[1] = float(mesh_position[1])
-            mesh.position[2] = float(mesh_position[2])
+            mesh.position[0] = mesh_x
+            mesh.position[1] = mesh_y
+            mesh.position[2] = mesh_z
             mesh.set_rotation(
                 x=rotation_x,
                 y=rotation_y,
-                z=rotation_z - self.facing_yaw + self.mesh_heading_offset,
+                z=final_rotation_z,
             )

@@ -1,5 +1,6 @@
 import os
 import random
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import arcade
@@ -20,10 +21,79 @@ PLAYER_TARGET_SIZE = 1.9
 PLAYER_NORMALIZE = True
 PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
+ENABLE_FRAME_PROFILER = True
+FRAME_PROFILER_PRINT_INTERVAL = 2.0
 SCENE_GLB_FILES = (
     ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
     ("break_time.glb", [12, 12, 0], 1.8, 0.44, 0.1),
 )
+
+
+class FrameProfiler:
+    def __init__(self, enabled=True, print_interval=2.0):
+        self.enabled = bool(enabled)
+        self.print_interval = float(print_interval)
+        self._started_at = time.perf_counter()
+        self._last_print = self._started_at
+        self._section_totals = {}
+        self._section_counts = {}
+
+    def section(self, name):
+        if not self.enabled:
+            return _NullProfileSection()
+        return _ProfileSection(self, name)
+
+    def add_sample(self, name, duration):
+        self._section_totals[name] = self._section_totals.get(name, 0.0) + float(duration)
+        self._section_counts[name] = self._section_counts.get(name, 0) + 1
+
+    def maybe_print(self):
+        if not self.enabled:
+            return
+
+        now = time.perf_counter()
+        elapsed = now - self._last_print
+        if elapsed < self.print_interval or not self._section_totals:
+            return
+
+        ordered_sections = sorted(
+            self._section_totals.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        summary_parts = []
+        for name, total in ordered_sections:
+            count = max(self._section_counts.get(name, 0), 1)
+            average_ms = (total / count) * 1000.0
+            summary_parts.append(f"{name}={average_ms:.2f}ms")
+
+        print(f"[frame-profiler] {', '.join(summary_parts)}")
+        self._section_totals.clear()
+        self._section_counts.clear()
+        self._last_print = now
+
+
+class _NullProfileSection:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _ProfileSection:
+    def __init__(self, profiler, name):
+        self.profiler = profiler
+        self.name = name
+        self.started_at = 0.0
+
+    def __enter__(self):
+        self.started_at = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.profiler.add_sample(self.name, time.perf_counter() - self.started_at)
+        return False
 
 
 def _preload_static_glb_asset(file_path, target_size, normalize, rotation_degrees=(0.0, 0.0, 0.0), include_positions=False):
@@ -101,6 +171,10 @@ class GameWindow(App):
         self._glb_material_cache = {}
         self._owned_materials = []
         self._scene_draw_meshes = []
+        self.profiler = FrameProfiler(
+            enabled=ENABLE_FRAME_PROFILER,
+            print_interval=FRAME_PROFILER_PRINT_INTERVAL,
+        )
         self._setup_scene()
 
     def _setup_scene(self):
@@ -248,6 +322,7 @@ class GameWindow(App):
             ground_height_fn=self.terrain_height,
             terrain_contains_fn=self.terrain_contains,
             always_play_walk=PLAYER_ALWAYS_PLAY_WALK,
+            profiler=self.profiler,
         )
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
 
@@ -525,26 +600,45 @@ class GameWindow(App):
         self.sky.destroy()
 
     def on_draw(self):
-        self.clear()
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glDepthMask(GL_FALSE)
-        self.sky.draw()
-        glDepthMask(GL_TRUE)
-        for mesh in self.terrain_meshes:
-            mesh.draw()
-        for mesh in self.player_meshes:
-            mesh.draw()
-        for cube in self.cubes:
-            cube.draw()
-        for mesh in self._scene_draw_meshes:
-            mesh.draw()
-        for lamp in self.lampada:
-            lamp.draw()
+        with self.profiler.section("draw.total"):
+            self.clear()
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+            with self.profiler.section("draw.sky"):
+                glDepthMask(GL_FALSE)
+                self.sky.draw()
+                glDepthMask(GL_TRUE)
+
+            with self.profiler.section("draw.terrain"):
+                for mesh in self.terrain_meshes:
+                    mesh.draw()
+
+            with self.profiler.section("draw.player"):
+                for mesh in self.player_meshes:
+                    mesh.draw()
+
+            with self.profiler.section("draw.cubes"):
+                for cube in self.cubes:
+                    cube.draw()
+
+            with self.profiler.section("draw.scene"):
+                for mesh in self._scene_draw_meshes:
+                    mesh.draw()
+
+            with self.profiler.section("draw.lamps"):
+                for lamp in self.lampada:
+                    lamp.draw()
+
+        self.profiler.maybe_print()
 
     def on_update(self, delta_time):
-        for light in self.dynamic_lights:
-            light.update()
-        self.player.update(delta_time)
+        with self.profiler.section("update.total"):
+            with self.profiler.section("update.lights"):
+                for light in self.dynamic_lights:
+                    light.update()
+
+            with self.profiler.section("update.player"):
+                self.player.update(delta_time)
 
         fps = 0 if delta_time <= 0 else round(1 / delta_time, 0)
         self.set_caption(str(fps))

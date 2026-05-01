@@ -1799,13 +1799,38 @@ class SkinnedAnimator:
         self.node_parents = node_parents
         self.animations = animations
         self.skins = skins
+        self.node_count = len(node_transforms)
         self.current_animation_name = None
         self.current_animation = None
+        self.current_channels = None
+        self.current_channel_items = ()
         self.current_time = 0.0
         self.loop = True
         self.paused = False
         self.revision = 0
         self._skin_matrix_cache = {}
+        self.base_translations = [
+            numpy.array(transform.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32)
+            for transform in node_transforms
+        ]
+        self.base_rotations = [
+            numpy.array(transform.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32)
+            for transform in node_transforms
+        ]
+        self.base_scales = [
+            numpy.array(transform.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32)
+            for transform in node_transforms
+        ]
+        self.base_local_matrices = [
+            self._compose_trs_matrix(
+                self.base_translations[node_index],
+                self.base_rotations[node_index],
+                self.base_scales[node_index],
+            )
+            for node_index in range(self.node_count)
+        ]
+        self.topological_order = self._build_topological_order()
+        self._prepare_animations()
         self.world_matrices = self._compute_world_matrices()
 
     def has_animation(self, name):
@@ -1820,8 +1845,11 @@ class SkinnedAnimator:
 
         self.current_animation_name = name
         self.current_animation = self.animations[name]
+        self.current_channels = self.current_animation["channels"]
+        self.current_channel_items = self.current_animation["channel_items"]
         self.loop = bool(loop)
         self.paused = bool(paused)
+        self._reset_animation_cursors()
 
         if hold_time is not None:
             self.current_time = float(hold_time)
@@ -1839,7 +1867,10 @@ class SkinnedAnimator:
                 previous_time = self.current_time
                 self.current_time += float(delta_time)
                 if self.loop:
+                    did_wrap = self.current_time >= duration
                     self.current_time %= duration
+                    if did_wrap:
+                        self._reset_animation_cursors()
                 else:
                     self.current_time = min(self.current_time, duration)
                 world_changed = abs(self.current_time - previous_time) > 1e-8
@@ -1867,15 +1898,13 @@ class SkinnedAnimator:
         return result
 
     def _compute_world_matrices(self):
-        local_matrices = []
-        for node_index, transform in enumerate(self.node_transforms):
-            channels = None if self.current_animation is None else self.current_animation["channels"].get(node_index)
+        local_matrices = list(self.base_local_matrices)
+        if self.current_channel_items:
+            for node_index, channels in self.current_channel_items:
+                translation = self.base_translations[node_index]
+                rotation = self.base_rotations[node_index]
+                scale = self.base_scales[node_index]
 
-            translation = numpy.array(transform.get("translation", [0.0, 0.0, 0.0]), dtype=numpy.float32)
-            rotation = numpy.array(transform.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=numpy.float32)
-            scale = numpy.array(transform.get("scale", [1.0, 1.0, 1.0]), dtype=numpy.float32)
-
-            if channels is not None:
                 if "translation" in channels:
                     translation = self._sample_channel(channels["translation"], self.current_time)
                 if "rotation" in channels:
@@ -1885,17 +1914,74 @@ class SkinnedAnimator:
                 if "scale" in channels:
                     scale = self._sample_channel(channels["scale"], self.current_time)
 
-            local_matrices.append(
-                Mesh._glb_node_matrix_cpu(
-                    {
-                        "translation": translation,
-                        "rotation": rotation,
-                        "scale": scale,
-                    }
-                )
-            )
+                local_matrices[node_index] = self._compose_trs_matrix(translation, rotation, scale)
 
-        return Mesh._build_node_world_matrices(local_matrices, self.node_parents)
+        world_matrices = [None] * self.node_count
+        for node_index in self.topological_order:
+            parent_index = self.node_parents[node_index]
+            local_matrix = local_matrices[node_index]
+            if parent_index >= 0:
+                world_matrices[node_index] = numpy.matmul(world_matrices[parent_index], local_matrix)
+            else:
+                world_matrices[node_index] = local_matrix
+        return world_matrices
+
+    def _prepare_animations(self):
+        for animation in self.animations.values():
+            channel_items = []
+            for node_index, channels in animation["channels"].items():
+                for channel in channels.values():
+                    channel["_cursor"] = 0
+                channel_items.append((node_index, channels))
+            animation["channel_items"] = tuple(channel_items)
+
+    def _reset_animation_cursors(self):
+        if self.current_animation is None:
+            return
+        for _node_index, channels in self.current_channel_items:
+            for channel in channels.values():
+                channel["_cursor"] = 0
+
+    def _build_topological_order(self):
+        children = [[] for _ in range(self.node_count)]
+        roots = []
+        for node_index, parent_index in enumerate(self.node_parents):
+            if parent_index >= 0:
+                children[parent_index].append(node_index)
+            else:
+                roots.append(node_index)
+
+        order = []
+        stack = list(reversed(roots))
+        while stack:
+            node_index = stack.pop()
+            order.append(node_index)
+            node_children = children[node_index]
+            for child_index in reversed(node_children):
+                stack.append(child_index)
+
+        if len(order) != self.node_count:
+            return list(range(self.node_count))
+        return order
+
+    @staticmethod
+    def _compose_trs_matrix(translation, rotation, scale):
+        x, y, z, w = rotation
+        rotation_matrix = numpy.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y), 0.0],
+                [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x), 0.0],
+                [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y), 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=numpy.float32,
+        )
+        result = rotation_matrix.copy()
+        result[0, :3] *= float(scale[0])
+        result[1, :3] *= float(scale[1])
+        result[2, :3] *= float(scale[2])
+        result[:3, 3] = translation
+        return result
 
     def _sample_channel(self, channel, time_value):
         times = channel["times"]
@@ -1905,13 +1991,24 @@ class SkinnedAnimator:
         if len(times) == 0:
             return values[0]
         if len(times) == 1 or time_value <= float(times[0]):
+            channel["_cursor"] = 0
             return values[0]
         if time_value >= float(times[-1]):
+            channel["_cursor"] = max(len(times) - 2, 0)
             return values[-1]
 
-        next_index = int(numpy.searchsorted(times, time_value, side="right"))
-        prev_index = max(next_index - 1, 0)
-        next_index = min(next_index, len(times) - 1)
+        prev_index = int(channel.get("_cursor", 0))
+        max_prev_index = len(times) - 2
+        if prev_index > max_prev_index:
+            prev_index = max_prev_index
+
+        while prev_index < max_prev_index and time_value > float(times[prev_index + 1]):
+            prev_index += 1
+        while prev_index > 0 and time_value < float(times[prev_index]):
+            prev_index -= 1
+
+        channel["_cursor"] = prev_index
+        next_index = prev_index + 1
 
         prev_time = float(times[prev_index])
         next_time = float(times[next_index])
@@ -2090,12 +2187,11 @@ class SkinnedMesh(Mesh):
         self._last_animator_revision = self.animator.revision
 
     def _compute_bone_matrices(self):
-        bone_matrices = self.animator.get_skin_matrices(
+        return self.animator.get_skin_matrices(
             self.skin_index,
             self.mesh_bind_matrix,
             mode=self.skinning_mode,
         )
-        return numpy.ascontiguousarray(bone_matrices, dtype=numpy.float32)
 
     def _apply_skinning_to_positions(self, bone_matrices):
         selected_bones = bone_matrices[self.base_joint_ids]
