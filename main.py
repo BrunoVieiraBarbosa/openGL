@@ -23,12 +23,29 @@ PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
 ENABLE_FRAME_PROFILER = False
 FRAME_PROFILER_PRINT_INTERVAL = 2.0
-ENABLE_NPC_VISION_DEBUG = True
+ENABLE_NPC_VISION_DEBUG = False
 NPC_PATROLS = (
     ((10.0, -10.0), (20.0, -10.5)),
     ((7.0, -9), (7.0, -1)),
     ((15.5, -4.0), (22.0, -3.5)),
     ((3.5, -12.0), (5.5, -6.5)),
+    ((11.5, 1.0), (17.0, 0.5)),
+    ((1.5, -2.0), (4.5, 2.0)),
+    ((18.0, -11.5), (24.0, -9.5)),
+    ((-0.5, -7.0), (3.0, -10.5)),
+    ((13.0, 4.5), (18.5, 6.0)),
+    ((6.0, 3.0), (9.5, 7.0)),
+    ((20.5, -0.5), (24.5, 3.5)),
+    ((2.0, 5.5), (5.5, 9.0)),
+    ((9.0, -13.5), (14.0, -15.0)),
+    ((16.0, 8.0), (22.0, 8.5)),
+    ((-1.0, 1.0), (2.5, 4.0)),
+    ((23.0, -6.0), (27.0, -2.0)),
+)
+SENTRY_NPC_POSTS = (
+    ((8.0, 11.0), 180.0),
+    ((21.5, 10.0), 215.0),
+    ((-0.5, 8.5), 330.0),
 )
 SCENE_GLB_FILES = (
     ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
@@ -169,8 +186,8 @@ class GameWindow(App):
         size = (1280, 720)
         super().__init__(size, ambient_color=(0.62, 0.67, 0.73, 1.0))
         self.fog_color = numpy.array([0.78, 0.79, 0.74], dtype=numpy.float32)
-        self.fog_near = 14.0
-        self.fog_far = 42.0
+        self.fog_near = 42.0
+        self.fog_far = 140.0
         self.set_mouse_visible(False)
         self.set_exclusive_mouse(True)
         self.cleaned_up = False
@@ -315,57 +332,53 @@ class GameWindow(App):
         self.npcs = []
         self.npc_draw_meshes = []
         self.npc_vision_gizmos = []
-        for npc_index, patrol_points in enumerate(NPC_PATROLS):
+        npc_index = 0
+        for patrol_points in NPC_PATROLS:
             grounded_waypoints = [
                 numpy.array([point[0], point[1], self.terrain_height(point[0], point[1])], dtype=numpy.float32)
                 for point in patrol_points
             ]
-            npc_meshes, _npc_materials, npc_visual = self._build_player_visual(
-                os.path.join("obj", "Player.glb"),
+            self._add_npc(
+                PatrolNPC,
                 grounded_waypoints[0],
+                waypoints=grounded_waypoints,
+                move_speed=1.35 + ((npc_index % 5) * 0.12),
+                turn_speed=165.0 + (npc_index * 25.0),
+                wait_time=0.8 + (npc_index * 0.35),
+                look_target_radius=4.2 + (npc_index * 0.35),
+                investigate_speed=1.75 + ((npc_index % 5) * 0.14),
+                investigate_radius=5.6 + (npc_index * 0.4),
+                investigate_duration=2.1 + (npc_index * 0.35),
+                investigate_stop_radius=1.05 + (npc_index * 0.08),
+                vision_angle_deg=max(42.0, 78.0 - (npc_index * 2.5)),
+                debug_color=(1.0, 0.35 + ((npc_index % 4) * 0.08), 0.18),
             )
-            npc_primary_mesh = self._get_primary_mesh(npc_meshes)
-            npc_primary_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
-            self.npcs.append(
-                PatrolNPC(
-                    npc_primary_mesh,
-                    grounded_waypoints[0],
-                    grounded_waypoints,
-                    visual_meshes=npc_meshes,
-                    animated_visual=npc_visual,
-                    ground_height_fn=self.terrain_height,
-                    mesh_rotation_offset=(0.0, 0.0, 0.0),
-                    mesh_position_offset=(0.0, 0.0, 0.0),
-                    mesh_heading_offset=-90.0,
-                    move_speed=1.45 + (npc_index * 0.2),
-                    turn_speed=165.0 + (npc_index * 25.0),
-                    wait_time=0.8 + (npc_index * 0.35),
-                    look_target=None,
-                    look_target_radius=2.8 + (npc_index * 0.35),
-                    investigate_speed=1.95 + (npc_index * 0.2),
-                    investigate_radius=3.6 + (npc_index * 0.35),
-                    investigate_duration=2.1 + (npc_index * 0.35),
-                    investigate_stop_radius=1.05 + (npc_index * 0.08),
-                    vision_angle_deg=78.0 - (npc_index * 8.0),
-                    perception_rotation_offset_deg=0.0,
-                )
+            npc_index += 1
+
+        for post_position, facing_yaw in SENTRY_NPC_POSTS:
+            grounded_position = numpy.array(
+                [post_position[0], post_position[1], self.terrain_height(post_position[0], post_position[1])],
+                dtype=numpy.float32,
             )
-            self.npc_draw_meshes.extend(npc_meshes)
-            if ENABLE_NPC_VISION_DEBUG:
-                self.npc_vision_gizmos.append(
-                    MeshRGB(
-                        self.shaders[1],
-                        grounded_waypoints[0].copy(),
-                        vertices=MeshRGB.create_sector(
-                            radius=3.6 + (npc_index * 0.35),
-                            angle_degrees=78.0 - (npc_index * 8.0),
-                            segments=18,
-                            color=(1.0, 0.35 + (npc_index * 0.1), 0.18),
-                            z_offset=0.03,
-                        ),
-                        scale=1.0,
-                    )
-                )
+            self._add_npc(
+                SentryNPC,
+                grounded_position,
+                home_position=grounded_position.copy(),
+                facing_yaw=facing_yaw,
+                move_speed=1.2,
+                turn_speed=190.0,
+                wait_time=0.0,
+                look_target_radius=5.2,
+                investigate_speed=1.95,
+                investigate_radius=6.8,
+                investigate_duration=2.8,
+                investigate_stop_radius=1.15,
+                vision_angle_deg=58.0,
+                scan_half_angle=40.0,
+                scan_speed=52.0,
+                return_speed=1.45,
+                debug_color=(0.35, 0.95, 0.5),
+            )
 
         static_colliders = self.scene_meshes + self.cubes + [npc.primary_mesh for npc in self.npcs]
         self.player = PlayerThirdPerson(
@@ -388,6 +401,45 @@ class GameWindow(App):
         for npc in self.npcs:
             npc.look_target = self.player
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
+
+    def _add_npc(self, npc_cls, spawn_position, debug_color=(1.0, 0.4, 0.2), **npc_kwargs):
+        npc_meshes, _npc_materials, npc_visual = self._build_player_visual(
+            os.path.join("obj", "Player.glb"),
+            spawn_position,
+        )
+        npc_primary_mesh = self._get_primary_mesh(npc_meshes)
+        npc_primary_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
+        npc = npc_cls(
+            npc_primary_mesh,
+            spawn_position,
+            visual_meshes=npc_meshes,
+            animated_visual=npc_visual,
+            ground_height_fn=self.terrain_height,
+            mesh_rotation_offset=(0.0, 0.0, 0.0),
+            mesh_position_offset=(0.0, 0.0, 0.0),
+            mesh_heading_offset=-90.0,
+            look_target=None,
+            perception_rotation_offset_deg=0.0,
+            profiler=self.profiler,
+            **npc_kwargs,
+        )
+        self.npcs.append(npc)
+        self.npc_draw_meshes.extend(npc_meshes)
+        if ENABLE_NPC_VISION_DEBUG:
+            self.npc_vision_gizmos.append(
+                MeshRGB(
+                    self.shaders[1],
+                    spawn_position.copy(),
+                    vertices=MeshRGB.create_sector(
+                        radius=float(npc.investigate_radius),
+                        angle_degrees=float(npc.vision_angle_deg),
+                        segments=18,
+                        color=debug_color,
+                        z_offset=0.03,
+                    ),
+                    scale=1.0,
+                )
+            )
 
     def _preload_scene_assets_parallel(self):
         cpu_count = os.cpu_count() or 1

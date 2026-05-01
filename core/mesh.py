@@ -32,12 +32,12 @@ class TerrainGridSampler:
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError("TerrainGridSampler expects Nx3 vertices.")
 
-        self.x_values = numpy.unique(numpy.round(self.vertices[:, 0], decimals=6))
-        self.y_values = numpy.unique(numpy.round(self.vertices[:, 1], decimals=6))
+        self.x_values = self._cluster_axis_values(self.vertices[:, 0])
+        self.y_values = self._cluster_axis_values(self.vertices[:, 1])
         self.cols = len(self.x_values)
         self.rows = len(self.y_values)
 
-        if self.cols < 2 or self.rows < 2 or self.cols * self.rows != len(self.vertices):
+        if self.cols < 2 or self.rows < 2:
             raise ValueError("TerrainGridSampler could not reconstruct a regular grid from OBJ vertices.")
 
         self.min_x = float(self.x_values[0])
@@ -46,10 +46,19 @@ class TerrainGridSampler:
         self.max_y = float(self.y_values[-1])
 
         self.height_grid = numpy.zeros((self.rows, self.cols), dtype=numpy.float32)
-        x_lookup = {round(float(value), 6): index for index, value in enumerate(self.x_values)}
-        y_lookup = {round(float(value), 6): index for index, value in enumerate(self.y_values)}
+        sample_counts = numpy.zeros((self.rows, self.cols), dtype=numpy.int32)
         for x, y, z in self.vertices:
-            self.height_grid[y_lookup[round(float(y), 6)], x_lookup[round(float(x), 6)]] = z
+            col_index = self._nearest_axis_index(self.x_values, x)
+            row_index = self._nearest_axis_index(self.y_values, y)
+            self.height_grid[row_index, col_index] += float(z)
+            sample_counts[row_index, col_index] += 1
+
+        occupied_mask = sample_counts > 0
+        if not numpy.any(occupied_mask):
+            raise ValueError("TerrainGridSampler could not map terrain vertices to a sampling grid.")
+
+        self.height_grid[occupied_mask] /= sample_counts[occupied_mask]
+        self._fill_missing_cells(occupied_mask)
 
     @classmethod
     def from_obj(cls, file_name):
@@ -135,6 +144,67 @@ class TerrainGridSampler:
         w2 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denominator
         w3 = 1.0 - w1 - w2
         return (w1 * az) + (w2 * bz) + (w3 * cz)
+
+    @staticmethod
+    def _nearest_axis_index(axis_values, coordinate):
+        insertion_index = int(numpy.searchsorted(axis_values, float(coordinate)))
+        if insertion_index <= 0:
+            return 0
+        if insertion_index >= len(axis_values):
+            return len(axis_values) - 1
+
+        previous_index = insertion_index - 1
+        if abs(float(axis_values[insertion_index]) - float(coordinate)) < abs(float(axis_values[previous_index]) - float(coordinate)):
+            return insertion_index
+        return previous_index
+
+    @staticmethod
+    def _cluster_axis_values(values):
+        rounded = numpy.sort(numpy.unique(numpy.round(values.astype(numpy.float32), decimals=6)))
+        if len(rounded) <= 2:
+            return rounded.astype(numpy.float32)
+
+        diffs = numpy.diff(rounded)
+        positive_diffs = diffs[diffs > 1e-6]
+        if len(positive_diffs) == 0:
+            return rounded.astype(numpy.float32)
+
+        tolerance = max(float(numpy.min(positive_diffs)) * 0.25, 1e-5)
+        clustered = [float(rounded[0])]
+        cluster_counts = [1]
+
+        for value in rounded[1:]:
+            value = float(value)
+            if abs(value - clustered[-1]) <= tolerance:
+                count = cluster_counts[-1] + 1
+                clustered[-1] = ((clustered[-1] * cluster_counts[-1]) + value) / count
+                cluster_counts[-1] = count
+            else:
+                clustered.append(value)
+                cluster_counts.append(1)
+
+        return numpy.array(clustered, dtype=numpy.float32)
+
+    def _fill_missing_cells(self, occupied_mask):
+        missing_positions = numpy.argwhere(~occupied_mask)
+        if len(missing_positions) == 0:
+            return
+
+        occupied_positions = numpy.argwhere(occupied_mask)
+        occupied_heights = self.height_grid[occupied_mask]
+        occupied_xy = numpy.column_stack(
+            [
+                self.x_values[occupied_positions[:, 1]],
+                self.y_values[occupied_positions[:, 0]],
+            ]
+        )
+
+        for row_index, col_index in missing_positions:
+            target_xy = numpy.array([self.x_values[col_index], self.y_values[row_index]], dtype=numpy.float32)
+            deltas = occupied_xy - target_xy
+            distances_sq = numpy.einsum("ij,ij->i", deltas, deltas)
+            nearest_index = int(numpy.argmin(distances_sq))
+            self.height_grid[row_index, col_index] = float(occupied_heights[nearest_index])
 
 
 class Mesh:
@@ -1794,6 +1864,11 @@ class Mesh:
 
 
 class SkinnedAnimator:
+    _SHARED_WORLD_CACHE_LIMIT = 192
+    _SHARED_SKIN_CACHE_LIMIT = 384
+    _shared_world_cache = {}
+    _shared_skin_cache = {}
+
     def __init__(self, node_transforms, node_parents, animations, skins) -> None:
         self.node_transforms = node_transforms
         self.node_parents = node_parents
@@ -1832,9 +1907,17 @@ class SkinnedAnimator:
         self.topological_order = self._build_topological_order()
         self._prepare_animations()
         self.world_matrices = self._compute_world_matrices()
+        self._shared_pose_key_base = self._build_shared_pose_key_base()
+        self._shared_pose_cache_key = self._make_shared_pose_cache_key()
 
     def has_animation(self, name):
         return name in self.animations
+
+    def get_animation_duration(self, name=None):
+        animation_name = self.current_animation_name if name is None else name
+        if animation_name not in self.animations:
+            return None
+        return float(self.animations[animation_name]["duration"])
 
     def play(self, name, loop=True, paused=False, restart=False, hold_time=None):
         if name not in self.animations:
@@ -1855,6 +1938,7 @@ class SkinnedAnimator:
             self.current_time = float(hold_time)
 
         self.world_matrices = self._compute_world_matrices()
+        self._shared_pose_cache_key = self._make_shared_pose_cache_key()
         self._skin_matrix_cache.clear()
         self.revision += 1
         return True
@@ -1877,8 +1961,33 @@ class SkinnedAnimator:
 
         if world_changed:
             self.world_matrices = self._compute_world_matrices()
+            self._shared_pose_cache_key = self._make_shared_pose_cache_key()
             self._skin_matrix_cache.clear()
             self.revision += 1
+
+    def set_time(self, time_value):
+        if self.current_animation is None:
+            return False
+
+        duration = float(self.current_animation["duration"])
+        if duration > 0.0:
+            next_time = float(time_value) % duration if self.loop else min(float(time_value), duration)
+        else:
+            next_time = 0.0
+
+        previous_time = self.current_time
+        if abs(next_time - previous_time) <= 1e-8:
+            return False
+
+        if next_time < previous_time:
+            self._reset_animation_cursors()
+
+        self.current_time = next_time
+        self.world_matrices = self._compute_world_matrices()
+        self._shared_pose_cache_key = self._make_shared_pose_cache_key()
+        self._skin_matrix_cache.clear()
+        self.revision += 1
+        return True
 
     def get_skin_matrices(self, skin_index, mesh_bind_matrix, mode="standard"):
         if skin_index is None or skin_index < 0 or skin_index >= len(self.skins):
@@ -1888,6 +1997,14 @@ class SkinnedAnimator:
         if cached is not None:
             return cached
 
+        shared_pose_key = self._shared_pose_cache_key
+        if shared_pose_key is not None:
+            shared_skin_key = (shared_pose_key, int(skin_index), mode)
+            shared_cached = SkinnedAnimator._shared_skin_cache.get(shared_skin_key)
+            if shared_cached is not None:
+                self._skin_matrix_cache[skin_index] = shared_cached
+                return shared_cached
+
         skin = self.skins[skin_index]
         joint_matrices = []
         for joint_node_index, inverse_bind_matrix in zip(skin["joints"], skin["inverse_bind_matrices"]):
@@ -1895,9 +2012,17 @@ class SkinnedAnimator:
             joint_matrices.append(numpy.matmul(joint_world, inverse_bind_matrix))
         result = numpy.array(joint_matrices, dtype=numpy.float32)
         self._skin_matrix_cache[skin_index] = result
+        if shared_pose_key is not None:
+            self._store_shared_skin_cache((shared_pose_key, int(skin_index), mode), result)
         return result
 
     def _compute_world_matrices(self):
+        shared_pose_key = self._make_shared_pose_cache_key()
+        if shared_pose_key is not None:
+            shared_cached = SkinnedAnimator._shared_world_cache.get(shared_pose_key)
+            if shared_cached is not None:
+                return shared_cached
+
         local_matrices = list(self.base_local_matrices)
         if self.current_channel_items:
             for node_index, channels in self.current_channel_items:
@@ -1924,6 +2049,8 @@ class SkinnedAnimator:
                 world_matrices[node_index] = numpy.matmul(world_matrices[parent_index], local_matrix)
             else:
                 world_matrices[node_index] = local_matrix
+        if shared_pose_key is not None:
+            self._store_shared_world_cache(shared_pose_key, world_matrices)
         return world_matrices
 
     def _prepare_animations(self):
@@ -1963,6 +2090,53 @@ class SkinnedAnimator:
         if len(order) != self.node_count:
             return list(range(self.node_count))
         return order
+
+    def _build_shared_pose_key_base(self):
+        animation_signatures = []
+        for animation_name in sorted(self.animations):
+            animation = self.animations[animation_name]
+            channel_signatures = []
+            for node_index, channels in animation["channels"].items():
+                channel_signatures.append((int(node_index), tuple(sorted(channels.keys()))))
+            animation_signatures.append(
+                (
+                    animation_name,
+                    round(float(animation.get("duration", 0.0)), 6),
+                    tuple(channel_signatures),
+                )
+            )
+
+        skin_signatures = []
+        for skin in self.skins:
+            skin_signatures.append(tuple(int(joint_index) for joint_index in skin["joints"]))
+
+        return (
+            tuple(int(parent_index) for parent_index in self.node_parents),
+            tuple(animation_signatures),
+            tuple(skin_signatures),
+        )
+
+    def _make_shared_pose_cache_key(self):
+        if self.current_animation_name is None:
+            return None
+        return (
+            self._shared_pose_key_base,
+            self.current_animation_name,
+            round(float(self.current_time), 6),
+            bool(self.paused),
+        )
+
+    @classmethod
+    def _store_shared_world_cache(cls, key, value):
+        cls._shared_world_cache[key] = value
+        if len(cls._shared_world_cache) > cls._SHARED_WORLD_CACHE_LIMIT:
+            cls._shared_world_cache.pop(next(iter(cls._shared_world_cache)))
+
+    @classmethod
+    def _store_shared_skin_cache(cls, key, value):
+        cls._shared_skin_cache[key] = value
+        if len(cls._shared_skin_cache) > cls._SHARED_SKIN_CACHE_LIMIT:
+            cls._shared_skin_cache.pop(next(iter(cls._shared_skin_cache)))
 
     @staticmethod
     def _compose_trs_matrix(translation, rotation, scale):
@@ -2214,6 +2388,9 @@ class SkinnedModel:
     def has_animation(self, name):
         return self.animator.has_animation(name)
 
+    def get_animation_duration(self, name=None):
+        return self.animator.get_animation_duration(name)
+
     def play(self, name, loop=True, paused=False, restart=False, hold_time=None):
         return self.animator.play(
             name,
@@ -2225,6 +2402,12 @@ class SkinnedModel:
 
     def update(self, delta_time):
         self.animator.update(delta_time)
+        for mesh in self.meshes:
+            if hasattr(mesh, "update_skinning"):
+                mesh.update_skinning()
+
+    def set_animation_time(self, time_value):
+        self.animator.set_time(time_value)
         for mesh in self.meshes:
             if hasattr(mesh, "update_skinning"):
                 mesh.update_skinning()

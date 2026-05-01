@@ -3,6 +3,7 @@ from contextlib import nullcontext
 import arcade
 import numpy
 
+from core.animation import CharacterAnimationController
 from core.core import CameraFirstPerson, CameraThirdPerson
 
 DIAGONAL_NORMALIZER = numpy.float32(0.70710677)
@@ -189,10 +190,7 @@ class PlayerThirdPerson(PlayerController):
         self.target_facing_yaw = float(self.camera.theta)
         self.turn_speed = 220.0
         self.last_world_direction = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float32)
-        self.active_animation_state = None
-        self._has_walk_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("walk"))
-        self._has_run_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("run"))
-        self._has_idle_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("idle"))
+        self.animation_controller = CharacterAnimationController(self.animated_visual)
         self._last_visual_signature = None
         self.camera.update_focus(self.position)
         self._sync_visuals()
@@ -290,52 +288,12 @@ class PlayerThirdPerson(PlayerController):
         return self._key_lshift in self.keys_down or self._key_rshift in self.keys_down
 
     def _update_animation(self, delta_time, is_moving, is_running):
-        if self.animated_visual is None:
-            return
-
-        if not self._has_walk_animation and not self._has_run_animation and not self._has_idle_animation:
-            return
-
-        target_state = "run" if is_running else ("walk" if (is_moving or self.always_play_walk) else "idle")
-        if target_state == "run" and not self._has_run_animation:
-            target_state = "walk"
-        if target_state == "walk" and not self._has_walk_animation:
-            target_state = "idle"
-
-        if target_state != self.active_animation_state:
-            if target_state == "idle":
-                if self._has_idle_animation:
-                    self.animated_visual.play(
-                        "idle",
-                        loop=True,
-                        paused=False,
-                        restart=True,
-                    )
-                elif self._has_walk_animation:
-                    self.animated_visual.play(
-                        "walk",
-                        loop=True,
-                        paused=True,
-                        restart=True,
-                        hold_time=0.0,
-                    )
-            elif target_state == "walk":
-                self.animated_visual.play(
-                    "walk",
-                    loop=True,
-                    paused=False,
-                    restart=True,
-                )
-            elif target_state == "run":
-                self.animated_visual.play(
-                    "run",
-                    loop=True,
-                    paused=False,
-                    restart=True,
-                )
-            self.active_animation_state = target_state
-
-        self.animated_visual.update(delta_time)
+        self.animation_controller.update_locomotion(
+            delta_time,
+            is_moving=is_moving,
+            is_running=is_running,
+            always_walk=self.always_play_walk,
+        )
 
     def _sync_visuals(self):
         mesh_x = float(self.position[0] + self.mesh_position_offset[0])
@@ -359,12 +317,11 @@ class PlayerThirdPerson(PlayerController):
             )
 
 
-class PatrolNPC:
+class BaseNPC:
     def __init__(
         self,
         primary_mesh,
         position,
-        waypoints,
         visual_meshes=None,
         animated_visual=None,
         ground_height_fn=None,
@@ -383,13 +340,12 @@ class PatrolNPC:
         investigate_stop_radius=1.15,
         vision_angle_deg=75.0,
         perception_rotation_offset_deg=0.0,
+        profiler=None,
     ) -> None:
         self.primary_mesh = primary_mesh
         self.visual_meshes = visual_meshes or [primary_mesh]
         self.animated_visual = animated_visual
         self.position = numpy.array(position, dtype=numpy.float32)
-        self.waypoints = [numpy.array(point, dtype=numpy.float32) for point in waypoints]
-        self.waypoint_index = 0
         self.ground_height_fn = ground_height_fn
         self.mesh_rotation_offset = mesh_rotation_offset or (0.0, 0.0, 0.0)
         self.mesh_position_offset = numpy.array(mesh_position_offset or (0.0, 0.0, 0.0), dtype=numpy.float32)
@@ -408,93 +364,133 @@ class PatrolNPC:
         self.vision_angle_deg = float(vision_angle_deg)
         self.vision_cos_threshold = float(numpy.cos(numpy.radians(self.vision_angle_deg * 0.5)))
         self.perception_rotation_offset_deg = float(perception_rotation_offset_deg)
+        self.profiler = profiler
         self.investigate_timer = 0.0
         self.facing_yaw = 0.0
         self.target_facing_yaw = 0.0
-        self.active_animation_state = None
-        self._has_walk_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("walk"))
-        self._has_idle_animation = bool(self.animated_visual is not None and self.animated_visual.has_animation("idle"))
+        self.is_moving = False
+        self.is_interacting_with_player = False
+        self._debug_cone_forward_vector = numpy.array([1.0, 0.0], dtype=numpy.float32)
+        self._debug_cone_rotation_z = 0.0
+        self.animation_controller = CharacterAnimationController(self.animated_visual)
+        self.animation_time = 0.0
         self._last_visual_signature = None
 
         if self.ground_height_fn is not None:
             self.position[2] = float(self.ground_height_fn(self.position[0], self.position[1]))
 
-        if self.waypoints:
-            first_target = self.waypoints[0] - self.position
-            if abs(float(first_target[0])) > 1e-6 or abs(float(first_target[1])) > 1e-6:
-                self.facing_yaw = float(numpy.degrees(numpy.arctan2(first_target[1], first_target[0])))
-                self.target_facing_yaw = self.facing_yaw
+        self._initialize_facing()
+        self._refresh_debug_cone_state()
         self._sync_visuals()
 
     def update(self, delta_time):
-        is_moving = False
-        is_interacting_with_player = False
+        with self._profile_section("npc.ai"):
+            self.is_moving = False
+            self.is_interacting_with_player = False
+            self._update_behavior(delta_time)
 
-        if self.look_target is not None:
-            target_position = self.look_target.position if hasattr(self.look_target, "position") else self.look_target
-            delta_x = float(target_position[0] - self.position[0])
-            delta_y = float(target_position[1] - self.position[1])
-            distance_sq = delta_x * delta_x + delta_y * delta_y
-            if distance_sq <= self.investigate_radius * self.investigate_radius and self._can_see_target(delta_x, delta_y):
-                self.investigate_timer = self.investigate_duration
+        with self._profile_section("npc.ground_sync"):
+            if self.ground_height_fn is not None:
+                self.position[2] = float(self.ground_height_fn(self.position[0], self.position[1]))
 
-            if self.investigate_timer > 0.0:
-                self.investigate_timer = max(0.0, self.investigate_timer - float(delta_time))
-                self.target_facing_yaw = float(numpy.degrees(numpy.arctan2(delta_y, delta_x)))
-                self._update_facing(delta_time)
-                is_interacting_with_player = True
+        with self._profile_section("npc.animation"):
+            self.animation_time += float(delta_time)
+            self._update_animation(delta_time, self.is_moving, self.is_interacting_with_player)
 
-                if distance_sq > self.investigate_stop_radius * self.investigate_stop_radius:
-                    distance = float(numpy.sqrt(distance_sq))
-                    direction_x = delta_x / distance
-                    direction_y = delta_y / distance
-                    move_step = min(self.investigate_speed * float(delta_time), max(0.0, distance - self.investigate_stop_radius))
-                    self.position[0] += direction_x * move_step
-                    self.position[1] += direction_y * move_step
-                    is_moving = move_step > 0.0
+        with self._profile_section("npc.visual_sync"):
+            self._sync_visuals()
 
-        if not is_interacting_with_player and self.wait_timer > 0.0:
-            self.wait_timer = max(0.0, self.wait_timer - float(delta_time))
+    def _initialize_facing(self):
+        return
 
-        if not is_interacting_with_player and self.wait_timer <= 0.0 and self.waypoints:
-            waypoint = self.waypoints[self.waypoint_index]
-            delta_x = float(waypoint[0] - self.position[0])
-            delta_y = float(waypoint[1] - self.position[1])
-            distance_sq = delta_x * delta_x + delta_y * delta_y
+    def _update_behavior(self, delta_time):
+        raise NotImplementedError
 
-            if distance_sq <= self.waypoint_tolerance * self.waypoint_tolerance:
-                self.waypoint_index = (self.waypoint_index + 1) % len(self.waypoints)
-                self.wait_timer = self.wait_time
-                waypoint = self.waypoints[self.waypoint_index]
-                delta_x = float(waypoint[0] - self.position[0])
-                delta_y = float(waypoint[1] - self.position[1])
-                distance_sq = delta_x * delta_x + delta_y * delta_y
+    def _get_target_delta(self):
+        if self.look_target is None:
+            return None
+        target_position = self.look_target.position if hasattr(self.look_target, "position") else self.look_target
+        delta_x = float(target_position[0] - self.position[0])
+        delta_y = float(target_position[1] - self.position[1])
+        distance_sq = delta_x * delta_x + delta_y * delta_y
+        return delta_x, delta_y, distance_sq
 
-            if distance_sq > 1e-8:
-                distance = float(numpy.sqrt(distance_sq))
-                direction_x = delta_x / distance
-                direction_y = delta_y / distance
-                self.target_facing_yaw = float(numpy.degrees(numpy.arctan2(direction_y, direction_x)))
-                self._update_facing(delta_time)
+    def _begin_investigation_if_target_visible(self, target_delta):
+        if target_delta is None:
+            return
+        delta_x, delta_y, distance_sq = target_delta
+        if distance_sq <= self.investigate_radius * self.investigate_radius and self._can_see_target(delta_x, delta_y):
+            self.investigate_timer = self.investigate_duration
 
-                move_step = min(self.move_speed * float(delta_time), distance)
-                self.position[0] += direction_x * move_step
-                self.position[1] += direction_y * move_step
-                is_moving = move_step > 0.0
+    def _update_investigation(self, delta_time, target_delta):
+        if self.investigate_timer <= 0.0 or target_delta is None:
+            return False
 
-        if self.ground_height_fn is not None:
-            self.position[2] = float(self.ground_height_fn(self.position[0], self.position[1]))
+        delta_x, delta_y, distance_sq = target_delta
+        self.investigate_timer = max(0.0, self.investigate_timer - float(delta_time))
+        self.target_facing_yaw = float(numpy.degrees(numpy.arctan2(delta_y, delta_x)))
+        self._update_facing(delta_time)
+        self.is_interacting_with_player = True
 
-        self._update_animation(delta_time, is_moving, is_interacting_with_player)
-        self._sync_visuals()
+        if distance_sq > self.investigate_stop_radius * self.investigate_stop_radius:
+            move_step = min(
+                self.investigate_speed * float(delta_time),
+                max(0.0, float(numpy.sqrt(distance_sq)) - self.investigate_stop_radius),
+            )
+            self.is_moving = self._move_in_direction(delta_x, delta_y, move_step) or self.is_moving
+        return True
+
+    def _move_in_direction(self, delta_x, delta_y, move_step):
+        distance_sq = delta_x * delta_x + delta_y * delta_y
+        if distance_sq <= 1e-8 or move_step <= 0.0:
+            return False
+        distance = float(numpy.sqrt(distance_sq))
+        self.position[0] += (delta_x / distance) * move_step
+        self.position[1] += (delta_y / distance) * move_step
+        return True
+
+    def _move_towards_point(self, delta_time, point, speed, stop_distance=0.0):
+        delta_x = float(point[0] - self.position[0])
+        delta_y = float(point[1] - self.position[1])
+        distance_sq = delta_x * delta_x + delta_y * delta_y
+        if distance_sq <= stop_distance * stop_distance:
+            return False
+
+        self.target_facing_yaw = float(numpy.degrees(numpy.arctan2(delta_y, delta_x)))
+        self._update_facing(delta_time)
+        move_step = min(speed * float(delta_time), max(0.0, float(numpy.sqrt(distance_sq)) - stop_distance))
+        if self._move_in_direction(delta_x, delta_y, move_step):
+            self.is_moving = True
+            return True
+        return False
 
     def _update_facing(self, delta_time):
         angle_delta = ((self.target_facing_yaw - self.facing_yaw + 180.0) % 360.0) - 180.0
         max_step = self.turn_speed * float(delta_time)
         if abs(angle_delta) <= max_step:
             self.facing_yaw = self.target_facing_yaw
+            self._refresh_debug_cone_state()
             return
         self.facing_yaw = float((self.facing_yaw + numpy.sign(angle_delta) * max_step) % 360.0)
+        self._refresh_debug_cone_state()
+
+    def _refresh_debug_cone_state(self):
+        base_rotation_radians = numpy.radians(self.get_visual_rotation_z())
+        base_x = float(numpy.cos(base_rotation_radians, dtype=numpy.float32))
+        base_y = float(numpy.sin(base_rotation_radians, dtype=numpy.float32))
+        heading_correction = numpy.radians(-self.mesh_heading_offset)
+        cos_angle = float(numpy.cos(heading_correction, dtype=numpy.float32))
+        sin_angle = float(numpy.sin(heading_correction, dtype=numpy.float32))
+        self._debug_cone_forward_vector[0] = (base_x * cos_angle) - (base_y * sin_angle)
+        self._debug_cone_forward_vector[1] = (base_x * sin_angle) + (base_y * cos_angle)
+        self._debug_cone_rotation_z = float(
+            numpy.degrees(
+                numpy.arctan2(
+                    self._debug_cone_forward_vector[1],
+                    self._debug_cone_forward_vector[0],
+                )
+            )
+        )
 
     def _can_see_target(self, delta_x, delta_y):
         distance_sq = (delta_x * delta_x) + (delta_y * delta_y)
@@ -504,33 +500,20 @@ class PatrolNPC:
         distance = float(numpy.sqrt(distance_sq))
         target_dir_x = delta_x / distance
         target_dir_y = delta_y / distance
-        cone_forward_vector = self.get_debug_cone_forward_vector()
-        dot = (float(cone_forward_vector[0]) * target_dir_x) + (float(cone_forward_vector[1]) * target_dir_y)
+        dot = (
+            float(self._debug_cone_forward_vector[0]) * target_dir_x
+        ) + (
+            float(self._debug_cone_forward_vector[1]) * target_dir_y
+        )
         return dot >= self.vision_cos_threshold
 
     def _update_animation(self, delta_time, is_moving, is_interacting_with_player):
-        if self.animated_visual is None:
-            return
-
-        target_state = "walk" if (is_moving and self._has_walk_animation) else "idle"
-        if is_interacting_with_player and not is_moving:
-            target_state = "idle"
-        if target_state == "idle" and not self._has_idle_animation and self._has_walk_animation:
-            self.animated_visual.play("walk", loop=True, paused=True, restart=self.active_animation_state != "idle", hold_time=0.0)
-            self.active_animation_state = "idle"
-            self.animated_visual.update(delta_time)
-            return
-
-        if target_state != self.active_animation_state:
-            self.animated_visual.play(
-                target_state,
-                loop=True,
-                paused=False,
-                restart=True,
-            )
-            self.active_animation_state = target_state
-
-        self.animated_visual.update(delta_time)
+        self.animation_controller.update_locomotion(
+            delta_time,
+            is_moving=is_moving,
+            force_idle=(is_interacting_with_player and not is_moving),
+            shared_time=self.animation_time,
+        )
 
     def _sync_visuals(self):
         mesh_x = float(self.position[0] + self.mesh_position_offset[0])
@@ -557,23 +540,114 @@ class PatrolNPC:
         return self.mesh_rotation_offset[2] - self.facing_yaw + self.mesh_heading_offset
 
     def get_perception_rotation_z(self):
-        cone_forward_vector = self.get_debug_cone_forward_vector()
-        return float(numpy.degrees(numpy.arctan2(cone_forward_vector[1], cone_forward_vector[0])))
+        return self._debug_cone_rotation_z
 
     def get_perception_forward_vector(self):
-        return self.get_debug_cone_forward_vector()
+        return self._debug_cone_forward_vector
 
     def get_debug_cone_forward_vector(self):
-        base_rotation_radians = numpy.radians(self.get_visual_rotation_z())
-        base_x = float(numpy.cos(base_rotation_radians, dtype=numpy.float32))
-        base_y = float(numpy.sin(base_rotation_radians, dtype=numpy.float32))
-        heading_correction = numpy.radians(-self.mesh_heading_offset)
-        cos_angle = float(numpy.cos(heading_correction, dtype=numpy.float32))
-        sin_angle = float(numpy.sin(heading_correction, dtype=numpy.float32))
-        return numpy.array(
-            [
-                (base_x * cos_angle) - (base_y * sin_angle),
-                (base_x * sin_angle) + (base_y * cos_angle),
-            ],
-            dtype=numpy.float32,
-        )
+        return self._debug_cone_forward_vector
+
+    def _profile_section(self, name):
+        if self.profiler is None:
+            return nullcontext()
+        return self.profiler.section(name)
+
+
+class PatrolNPC(BaseNPC):
+    def __init__(
+        self,
+        primary_mesh,
+        position,
+        waypoints,
+        **kwargs,
+    ) -> None:
+        self.waypoints = [numpy.array(point, dtype=numpy.float32) for point in waypoints]
+        self.waypoint_index = 0
+        super().__init__(primary_mesh, position, **kwargs)
+
+    def _initialize_facing(self):
+        if not self.waypoints:
+            return
+        first_target = self.waypoints[0] - self.position
+        if abs(float(first_target[0])) > 1e-6 or abs(float(first_target[1])) > 1e-6:
+            self.facing_yaw = float(numpy.degrees(numpy.arctan2(first_target[1], first_target[0])))
+            self.target_facing_yaw = self.facing_yaw
+
+    def _update_behavior(self, delta_time):
+        target_delta = self._get_target_delta()
+        self._begin_investigation_if_target_visible(target_delta)
+        if self._update_investigation(delta_time, target_delta):
+            return
+
+        if self.wait_timer > 0.0:
+            self.wait_timer = max(0.0, self.wait_timer - float(delta_time))
+            return
+
+        if not self.waypoints:
+            return
+
+        waypoint = self.waypoints[self.waypoint_index]
+        delta_x = float(waypoint[0] - self.position[0])
+        delta_y = float(waypoint[1] - self.position[1])
+        distance_sq = delta_x * delta_x + delta_y * delta_y
+        if distance_sq <= self.waypoint_tolerance * self.waypoint_tolerance:
+            self.waypoint_index = (self.waypoint_index + 1) % len(self.waypoints)
+            self.wait_timer = self.wait_time
+            return
+
+        self._move_towards_point(delta_time, waypoint, self.move_speed)
+
+
+class SentryNPC(BaseNPC):
+    def __init__(
+        self,
+        primary_mesh,
+        position,
+        home_position=None,
+        facing_yaw=0.0,
+        scan_half_angle=45.0,
+        scan_speed=55.0,
+        return_speed=1.5,
+        **kwargs,
+    ) -> None:
+        if home_position is None:
+            home_position = position
+        self.home_position = numpy.array(home_position, dtype=numpy.float32)
+        self.base_facing_yaw = float(facing_yaw)
+        self.scan_half_angle = float(scan_half_angle)
+        self.scan_speed = float(scan_speed)
+        self.return_speed = float(return_speed)
+        self.scan_direction = 1.0
+        super().__init__(primary_mesh, position, **kwargs)
+
+    def _initialize_facing(self):
+        self.facing_yaw = self.base_facing_yaw
+        self.target_facing_yaw = self.base_facing_yaw
+
+    def _update_behavior(self, delta_time):
+        target_delta = self._get_target_delta()
+        self._begin_investigation_if_target_visible(target_delta)
+        if self._update_investigation(delta_time, target_delta):
+            return
+
+        home_delta_x = float(self.home_position[0] - self.position[0])
+        home_delta_y = float(self.home_position[1] - self.position[1])
+        home_distance_sq = home_delta_x * home_delta_x + home_delta_y * home_delta_y
+        if home_distance_sq > self.waypoint_tolerance * self.waypoint_tolerance:
+            self._move_towards_point(delta_time, self.home_position, self.return_speed)
+            return
+
+        self.position[0] = float(self.home_position[0])
+        self.position[1] = float(self.home_position[1])
+        next_yaw = self.target_facing_yaw + (self.scan_direction * self.scan_speed * float(delta_time))
+        max_yaw = self.base_facing_yaw + self.scan_half_angle
+        min_yaw = self.base_facing_yaw - self.scan_half_angle
+        if next_yaw >= max_yaw:
+            next_yaw = max_yaw
+            self.scan_direction = -1.0
+        elif next_yaw <= min_yaw:
+            next_yaw = min_yaw
+            self.scan_direction = 1.0
+        self.target_facing_yaw = next_yaw
+        self._update_facing(delta_time)
