@@ -21,7 +21,7 @@ PLAYER_TARGET_SIZE = 1.9
 PLAYER_NORMALIZE = True
 PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
-ENABLE_FRAME_PROFILER = False
+ENABLE_FRAME_PROFILER = True
 FRAME_PROFILER_PRINT_INTERVAL = 2.0
 ENABLE_NPC_VISION_DEBUG = False
 NPC_PATROLS = (
@@ -46,6 +46,13 @@ SENTRY_NPC_POSTS = (
     ((8.0, 11.0), 180.0),
     ((21.5, 10.0), 215.0),
     ((-0.5, 8.5), 330.0),
+)
+IRONMAN_NPC_PATROLS = (
+    ((28.0, 4.0), (34.0, 4.5)),
+    ((30.0, -4.0), (35.0, -1.0)),
+    ((25.0, 11.0), (31.0, 12.0)),
+    ((18.0, 14.0), (24.0, 15.0)),
+    ((33.0, 8.0), (38.0, 10.0)),
 )
 SCENE_GLB_FILES = (
     ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
@@ -380,6 +387,30 @@ class GameWindow(App):
                 debug_color=(0.35, 0.95, 0.5),
             )
 
+        for ironman_index, patrol_points in enumerate(IRONMAN_NPC_PATROLS):
+            grounded_waypoints = [
+                numpy.array([point[0], point[1], self.terrain_height(point[0], point[1])], dtype=numpy.float32)
+                for point in patrol_points
+            ]
+            self._add_npc(
+                PatrolNPC,
+                grounded_waypoints[0],
+                model_path=os.path.join("obj", "IronMan.glb"),
+                target_size=1.8,
+                normalize=True,
+                waypoints=grounded_waypoints,
+                move_speed=1.2 + (ironman_index * 0.08),
+                turn_speed=150.0 + (ironman_index * 18.0),
+                wait_time=1.1 + (ironman_index * 0.2),
+                look_target_radius=4.8,
+                investigate_speed=1.6 + (ironman_index * 0.1),
+                investigate_radius=6.0,
+                investigate_duration=2.6,
+                investigate_stop_radius=1.1,
+                vision_angle_deg=70.0,
+                debug_color=(1.0, 0.72, 0.22),
+            )
+
         static_colliders = self.scene_meshes + self.cubes + [npc.primary_mesh for npc in self.npcs]
         self.player = PlayerThirdPerson(
             self.camera,
@@ -402,11 +433,37 @@ class GameWindow(App):
             npc.look_target = self.player
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
 
-    def _add_npc(self, npc_cls, spawn_position, debug_color=(1.0, 0.4, 0.2), **npc_kwargs):
-        npc_meshes, _npc_materials, npc_visual = self._build_player_visual(
-            os.path.join("obj", "Player.glb"),
-            spawn_position,
-        )
+    def _add_npc(
+        self,
+        npc_cls,
+        spawn_position,
+        debug_color=(1.0, 0.4, 0.2),
+        model_path=None,
+        target_size=None,
+        normalize=None,
+        **npc_kwargs,
+    ):
+        if model_path is None:
+            model_path = os.path.join("obj", "Player.glb")
+
+        if model_path.endswith("Player.glb"):
+            npc_meshes, _npc_materials, npc_visual = self._build_player_visual(
+                model_path,
+                spawn_position,
+            )
+        else:
+            if target_size is None:
+                target_size = 1.8
+            if normalize is None:
+                normalize = True
+            npc_meshes, _npc_materials = self._build_glb_model(
+                model_path,
+                spawn_position,
+                target_size=target_size,
+                normalize=normalize,
+            )
+            npc_visual = None
+
         npc_primary_mesh = self._get_primary_mesh(npc_meshes)
         npc_primary_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
         npc = npc_cls(
