@@ -21,8 +21,15 @@ PLAYER_TARGET_SIZE = 1.9
 PLAYER_NORMALIZE = True
 PLAYER_ALLOW_STATIC_FALLBACK = False
 PLAYER_ALWAYS_PLAY_WALK = False
-ENABLE_FRAME_PROFILER = True
+ENABLE_FRAME_PROFILER = False
 FRAME_PROFILER_PRINT_INTERVAL = 2.0
+ENABLE_NPC_VISION_DEBUG = True
+NPC_PATROLS = (
+    ((10.0, -10.0), (20.0, -10.5)),
+    ((7.0, -9), (7.0, -1)),
+    ((15.5, -4.0), (22.0, -3.5)),
+    ((3.5, -12.0), (5.5, -6.5)),
+)
 SCENE_GLB_FILES = (
     ("IronMan.glb", [27, 1, 0], 1.8, 0.38, 0.1),
     ("break_time.glb", [12, 12, 0], 1.8, 0.44, 0.1),
@@ -301,12 +308,66 @@ class GameWindow(App):
         )
         self.player_mesh = self._get_primary_mesh(self.player_meshes)
         self.player_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
-
         self.camera = CameraThirdPerson(player_start, distance=5.6, height=1.55)
         self.camera.theta = 72
         self.camera.phi = -20
         self.sky.position = self.camera
-        static_colliders = self.scene_meshes + self.cubes
+        self.npcs = []
+        self.npc_draw_meshes = []
+        self.npc_vision_gizmos = []
+        for npc_index, patrol_points in enumerate(NPC_PATROLS):
+            grounded_waypoints = [
+                numpy.array([point[0], point[1], self.terrain_height(point[0], point[1])], dtype=numpy.float32)
+                for point in patrol_points
+            ]
+            npc_meshes, _npc_materials, npc_visual = self._build_player_visual(
+                os.path.join("obj", "Player.glb"),
+                grounded_waypoints[0],
+            )
+            npc_primary_mesh = self._get_primary_mesh(npc_meshes)
+            npc_primary_mesh.set_collider(mode="circle", radius_scale=0.55, radius_padding=0.06, height_padding=0.12)
+            self.npcs.append(
+                PatrolNPC(
+                    npc_primary_mesh,
+                    grounded_waypoints[0],
+                    grounded_waypoints,
+                    visual_meshes=npc_meshes,
+                    animated_visual=npc_visual,
+                    ground_height_fn=self.terrain_height,
+                    mesh_rotation_offset=(0.0, 0.0, 0.0),
+                    mesh_position_offset=(0.0, 0.0, 0.0),
+                    mesh_heading_offset=-90.0,
+                    move_speed=1.45 + (npc_index * 0.2),
+                    turn_speed=165.0 + (npc_index * 25.0),
+                    wait_time=0.8 + (npc_index * 0.35),
+                    look_target=None,
+                    look_target_radius=2.8 + (npc_index * 0.35),
+                    investigate_speed=1.95 + (npc_index * 0.2),
+                    investigate_radius=3.6 + (npc_index * 0.35),
+                    investigate_duration=2.1 + (npc_index * 0.35),
+                    investigate_stop_radius=1.05 + (npc_index * 0.08),
+                    vision_angle_deg=78.0 - (npc_index * 8.0),
+                    perception_rotation_offset_deg=0.0,
+                )
+            )
+            self.npc_draw_meshes.extend(npc_meshes)
+            if ENABLE_NPC_VISION_DEBUG:
+                self.npc_vision_gizmos.append(
+                    MeshRGB(
+                        self.shaders[1],
+                        grounded_waypoints[0].copy(),
+                        vertices=MeshRGB.create_sector(
+                            radius=3.6 + (npc_index * 0.35),
+                            angle_degrees=78.0 - (npc_index * 8.0),
+                            segments=18,
+                            color=(1.0, 0.35 + (npc_index * 0.1), 0.18),
+                            z_offset=0.03,
+                        ),
+                        scale=1.0,
+                    )
+                )
+
+        static_colliders = self.scene_meshes + self.cubes + [npc.primary_mesh for npc in self.npcs]
         self.player = PlayerThirdPerson(
             self.camera,
             self.shaders,
@@ -324,6 +385,8 @@ class GameWindow(App):
             always_play_walk=PLAYER_ALWAYS_PLAY_WALK,
             profiler=self.profiler,
         )
+        for npc in self.npcs:
+            npc.look_target = self.player
         self.player.update(0.1 if PLAYER_ALWAYS_PLAY_WALK and PLAYER_RENDER_MODE == "skinned_walk" else 0.0)
 
     def _preload_scene_assets_parallel(self):
@@ -591,6 +654,10 @@ class GameWindow(App):
             mesh.destroy()
         for mesh in self.player_meshes:
             mesh.destroy()
+        for mesh in self.npc_draw_meshes:
+            mesh.destroy()
+        for gizmo in self.npc_vision_gizmos:
+            gizmo.destroy()
         for mesh in self._scene_draw_meshes:
             mesh.destroy()
         for cube in self.cubes:
@@ -617,6 +684,15 @@ class GameWindow(App):
                 for mesh in self.player_meshes:
                     mesh.draw()
 
+            with self.profiler.section("draw.npcs"):
+                for mesh in self.npc_draw_meshes:
+                    mesh.draw()
+
+            if self.npc_vision_gizmos:
+                with self.profiler.section("draw.npc_debug"):
+                    for gizmo in self.npc_vision_gizmos:
+                        gizmo.draw()
+
             with self.profiler.section("draw.cubes"):
                 for cube in self.cubes:
                     cube.draw()
@@ -639,6 +715,16 @@ class GameWindow(App):
 
             with self.profiler.section("update.player"):
                 self.player.update(delta_time)
+
+            with self.profiler.section("update.npcs"):
+                for npc in self.npcs:
+                    npc.update(delta_time)
+                for npc, gizmo in zip(self.npcs, self.npc_vision_gizmos):
+                    gizmo.position[0] = float(npc.position[0])
+                    gizmo.position[1] = float(npc.position[1])
+                    gizmo.position[2] = float(npc.position[2])
+                    forward_vector = npc.get_debug_cone_forward_vector()
+                    gizmo.set_direction_2d(forward_vector[0], forward_vector[1])
 
         fps = 0 if delta_time <= 0 else round(1 / delta_time, 0)
         self.set_caption(str(fps))

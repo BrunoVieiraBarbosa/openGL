@@ -2084,6 +2084,9 @@ class SkinnedMesh(Mesh):
         self.rotation = [0, 0, 0]
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
+        self._bounds_cache = None
+        self._ground_footprint_cache = None
+        self._bounds_cache_key = None
         glUseProgram(self.shader)
 
         self.base_vertex_size = 19
@@ -2243,6 +2246,7 @@ class MeshRGB:
         self.billboard_target = billboard_target
         self.identity = pyrr.matrix44.create_identity(dtype=numpy.float32)
         self.model = None
+        self.rotation = [0.0, 0.0, 0.0]
         glUseProgram(self.shader)
         #x, y, z, r, g, b
         if vertices != None:
@@ -2363,6 +2367,66 @@ class MeshRGB:
 
         return tuple(vertices)
 
+    @staticmethod
+    def create_sector(radius=1.0, angle_degrees=75.0, segments=16, color=(1.0, 0.4, 0.25), z_offset=0.02):
+        vertices = []
+        center = [0.0, 0.0, z_offset, *color]
+        half_angle = numpy.radians(angle_degrees * 0.5)
+
+        for index in range(segments):
+            t0 = index / segments
+            t1 = (index + 1) / segments
+            angle0 = -half_angle + (2.0 * half_angle * t0)
+            angle1 = -half_angle + (2.0 * half_angle * t1)
+            p0 = [numpy.cos(angle0) * radius, numpy.sin(angle0) * radius, z_offset, *color]
+            p1 = [numpy.cos(angle1) * radius, numpy.sin(angle1) * radius, z_offset, *color]
+            vertices.extend(center)
+            vertices.extend(p0)
+            vertices.extend(p1)
+
+        return tuple(vertices)
+
+    def _compose_rotation_matrix(self):
+        model = pyrr.matrix44.multiply(
+            self.identity,
+            pyrr.matrix44.create_from_x_rotation(theta=numpy.radians(self.rotation[0]), dtype=numpy.float32),
+        )
+        model = pyrr.matrix44.multiply(
+            model,
+            pyrr.matrix44.create_from_y_rotation(theta=numpy.radians(self.rotation[1]), dtype=numpy.float32),
+        )
+        return pyrr.matrix44.multiply(
+            model,
+            pyrr.matrix44.create_from_z_rotation(theta=numpy.radians(self.rotation[2]), dtype=numpy.float32),
+        )
+
+    def _build_model_matrix(self, position, rotation_matrix):
+        scale_matrix = pyrr.matrix44.create_from_scale(
+            numpy.array([self.scale, self.scale, self.scale], dtype=numpy.float32),
+            dtype=numpy.float32,
+        )
+        translation_matrix = pyrr.matrix44.create_from_translation(vec=position, dtype=numpy.float32)
+        model = pyrr.matrix44.multiply(scale_matrix, rotation_matrix)
+        return pyrr.matrix44.multiply(model, translation_matrix)
+
+    def set_rotation(self, x=None, y=None, z=None):
+        if x is not None:
+            self.rotation[0] = float(x) % 360.0
+        if y is not None:
+            self.rotation[1] = float(y) % 360.0
+        if z is not None:
+            self.rotation[2] = float(z) % 360.0
+        position = self.position.position if hasattr(self.position, "position") else self.position
+        position = numpy.array(position, dtype=numpy.float32)
+        self.model = self._build_model_matrix(position, self._compose_rotation_matrix())
+
+    def set_direction_2d(self, direction_x, direction_y):
+        length_sq = float(direction_x * direction_x + direction_y * direction_y)
+        if length_sq <= 1e-8:
+            return
+        angle = float(numpy.degrees(numpy.arctan2(direction_y, direction_x)))
+        self.set_rotation(z=angle)
+
 
     def draw(self):
         glUseProgram(self.shader)
@@ -2398,12 +2462,7 @@ class MeshRGB:
                 dtype=numpy.float32,
             )
         else:
-            scale_matrix = pyrr.matrix44.create_from_scale(
-                numpy.array([self.scale, self.scale, self.scale], dtype=numpy.float32),
-                dtype=numpy.float32,
-            )
-            translation_matrix = pyrr.matrix44.create_from_translation(vec=position, dtype=numpy.float32)
-            self.model = pyrr.matrix44.multiply(scale_matrix, translation_matrix)
+            self.model = self._build_model_matrix(position, self._compose_rotation_matrix())
 
         glUniformMatrix4fv(get_uniform_location(self.shader, "model"), 1, GL_FALSE, self.model)
         glBindVertexArray(self.vao)
